@@ -34,6 +34,16 @@ class E1IntegrationTest(unittest.TestCase):
         self.assertEqual(config['dataset']['depth_scale'], 'none')
         self.assertIsInstance(config['geometry_e1']['plane']['camera_height_m'], float)
 
+    def test_touchpoint_v2_config_uses_stronger_relative_supervision(self):
+        config = load_config(
+            ROOT / 'configs' / 'e1_feature_level_touch_v2.yaml',
+            ROOT / 'missing.env')
+        touch = config['geometry_e1']['touchpoint']
+        self.assertEqual(touch['loss_coordinate_mode'], 'box_relative')
+        self.assertAlmostEqual(touch['smooth_l1_beta'], 0.05)
+        self.assertTrue(touch['require_inside_image'])
+        self.assertTrue(touch['box_detach'])
+
     def test_optimizer_groups_every_parameter_once(self):
         model = NamedToyModel()
         optimizer = build_optimizer({
@@ -79,6 +89,42 @@ class E1IntegrationTest(unittest.TestCase):
         total = sum(losses.values())
         self.assertTrue(torch.isfinite(total))
         total.backward()
+
+    def test_touchpoint_box_relative_loss_uses_gt_box_coordinates(self):
+        matcher = HungarianMatcher(1, 1, 1, 1)
+        criterion = SetCriterion(
+            3, matcher, {}, 0.25, [], group_num=1,
+            geometry_cfg={
+                'enabled': True,
+                'touchpoint': {
+                    'class_index': 1,
+                    'loss_coordinate_mode': 'box_relative',
+                    'smooth_l1_beta': 0.05,
+                },
+            })
+        relative = torch.tensor(
+            [[[[0.1, 0.9], [0.9, 0.9], [0.8, 0.7], [0.2, 0.7]]]],
+            requires_grad=True)
+        top_left = torch.tensor([0.25, 0.25])
+        size = torch.tensor([0.5, 0.5])
+        absolute = top_left + relative * size
+        outputs = {
+            'pred_touchpoints': absolute,
+            'pred_touchpoints_rel': relative,
+            'pred_horizon_logits': torch.zeros(1, 1, 96, 320),
+        }
+        targets = [{
+            'labels': torch.tensor([1]),
+            'boxes_3d': torch.tensor([[0.5, 0.5, 0.25, 0.25, 0.25, 0.25]]),
+            'touch_points': absolute.detach().squeeze(0),
+            'touchpoint_valid': torch.ones(1, 4, dtype=torch.bool),
+        }]
+        indices = [(torch.tensor([0]), torch.tensor([0]))]
+        losses = criterion.loss_touchpoints(outputs, targets, indices, 1.0)
+        self.assertAlmostEqual(losses['loss_touchpoint'].item(), 0.0, places=7)
+        self.assertEqual(losses['touchpoint_valid_count'].item(), 4.0)
+        losses['loss_touchpoint'].backward()
+        self.assertIsNotNone(relative.grad)
 
 
 if __name__ == '__main__':

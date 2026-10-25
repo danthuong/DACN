@@ -66,6 +66,31 @@ def _is_power_of_2(n):
     return (n & (n-1) == 0) and n != 0
 
 
+def _ms_deform_attn_cuda_compatible(value, spatial_shapes,
+                                    level_start_index, sampling_locations,
+                                    attention_weights, im2col_step):
+    """Run the legacy CUDA extension in FP32 under mixed precision.
+
+    The extension bundled with this MonoDETR version is compiled only for
+    float/double, so passing autocast FP16/BF16 tensors raises
+    ``not implemented for 'Half'``.  Keeping the cast around the custom op
+    preserves AMP for the surrounding projections and the rest of the model.
+    Autograd propagates through both casts and the extension's FP32 backward.
+    """
+    output_dtype = value.dtype
+    needs_fp32 = value.is_cuda and output_dtype != torch.float32
+    if needs_fp32:
+        with torch.cuda.amp.autocast(enabled=False):
+            output = MSDeformAttnFunction.apply(
+                value.float(), spatial_shapes, level_start_index,
+                sampling_locations.float(), attention_weights.float(),
+                im2col_step)
+        return output.to(dtype=output_dtype)
+    return MSDeformAttnFunction.apply(
+        value, spatial_shapes, level_start_index, sampling_locations,
+        attention_weights, im2col_step)
+
+
 class MSDeformAttn(nn.Module):
     def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4, conditional=False):
         """
@@ -156,8 +181,9 @@ class MSDeformAttn(nn.Module):
         else:
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
-        output = MSDeformAttnFunction.apply(
-            value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+        output = _ms_deform_attn_cuda_compatible(
+            value, input_spatial_shapes, input_level_start_index,
+            sampling_locations, attention_weights, self.im2col_step)
         output = self.output_proj(output)
         return output
 
@@ -250,8 +276,9 @@ class MSDeformAttn_cross(nn.Module):
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
   
-        output = MSDeformAttnFunction.apply(
-            value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+        output = _ms_deform_attn_cuda_compatible(
+            value, input_spatial_shapes, input_level_start_index,
+            sampling_locations, attention_weights, self.im2col_step)
         output = self.output_proj(output)
         return output
 

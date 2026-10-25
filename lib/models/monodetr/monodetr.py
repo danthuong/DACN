@@ -419,6 +419,16 @@ class SetCriterion(nn.Module):
         self.horizon_sigma = float(horizon_cfg.get('gaussian_sigma_heatmap_px', 1.5))
         self.horizon_stride = int(horizon_cfg.get('heatmap_stride', 4))
         self.touchpoint_class_index = int(touch_cfg.get('class_index', 1))
+        self.touchpoint_loss_coordinate_mode = str(
+            touch_cfg.get('loss_coordinate_mode', 'image_normalized')).lower()
+        if self.touchpoint_loss_coordinate_mode not in (
+                'image_normalized', 'box_relative'):
+            raise ValueError(
+                'touchpoint.loss_coordinate_mode must be image_normalized or box_relative')
+        self.touchpoint_smooth_l1_beta = float(
+            touch_cfg.get('smooth_l1_beta', 1.0))
+        if self.touchpoint_smooth_l1_beta <= 0:
+            raise ValueError('touchpoint.smooth_l1_beta must be positive')
         self.pass1_aux_detection_coef = float(
             self.geometry_cfg.get('losses', {}).get(
                 'pass1_aux_detection_loss_coef_phase2', 0.0))
@@ -632,7 +642,7 @@ class SetCriterion(nn.Module):
 
     def loss_touchpoints(self, outputs, targets, indices, num_boxes):
         source_index = self._get_src_permutation_idx(indices)
-        predicted = outputs['pred_touchpoints'][source_index]
+        predicted_absolute = outputs['pred_touchpoints'][source_index]
         target_points = torch.cat([
             target['touch_points'][target_indices]
             for target, (_, target_indices) in zip(targets, indices)
@@ -648,16 +658,42 @@ class SetCriterion(nn.Module):
         valid &= labels[:, None] == self.touchpoint_class_index
         valid_count = valid.sum()
         if int(valid_count.item()) == 0:
-            zero = predicted.sum() * 0.0
-            return {'loss_touchpoint': zero, 'touchpoint_mae_px': zero.detach()}
-        difference = predicted - target_points
+            zero = predicted_absolute.sum() * 0.0
+            return {
+                'loss_touchpoint': zero,
+                'touchpoint_mae_px': zero.detach(),
+                'touchpoint_valid_count': valid_count.detach().float(),
+            }
+
+        if self.touchpoint_loss_coordinate_mode == 'box_relative':
+            predicted_for_loss = outputs['pred_touchpoints_rel'][source_index]
+            target_boxes = torch.cat([
+                target['boxes_3d'][target_indices]
+                for target, (_, target_indices) in zip(targets, indices)
+            ], dim=0)
+            target_xyxy = box_ops.box_cxcylrtb_to_xyxy(target_boxes)
+            target_top_left = target_xyxy[:, None, :2]
+            target_size = (
+                target_xyxy[:, None, 2:] - target_xyxy[:, None, :2]
+            ).clamp_min(1e-6)
+            target_for_loss = (target_points - target_top_left) / target_size
+        else:
+            predicted_for_loss = predicted_absolute
+            target_for_loss = target_points
+
+        difference = predicted_absolute - target_points
         loss = F.smooth_l1_loss(
-            predicted[valid], target_points[valid], reduction='sum') / valid_count
+            predicted_for_loss[valid], target_for_loss[valid],
+            reduction='sum', beta=self.touchpoint_smooth_l1_beta) / valid_count
         input_h = outputs['pred_horizon_logits'].shape[-2] * self.horizon_stride
         input_w = outputs['pred_horizon_logits'].shape[-1] * self.horizon_stride
         pixel_error = (difference * difference.new_tensor([input_w, input_h])).abs()
         pixel_mae = pixel_error[valid].mean().detach()
-        return {'loss_touchpoint': loss, 'touchpoint_mae_px': pixel_mae}
+        return {
+            'loss_touchpoint': loss,
+            'touchpoint_mae_px': pixel_mae,
+            'touchpoint_valid_count': valid_count.detach().float(),
+        }
 
     def loss_geometry_metrics(self, outputs, targets, indices, num_boxes):
         geometry = outputs.get('geometry')

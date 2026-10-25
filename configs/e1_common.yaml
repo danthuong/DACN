@@ -4,7 +4,7 @@ random_seed: 444
 
 dataset:
   root_dir: "${KITTI_ROOT:-data/KITTIDataset}"
-  batch_size: 2
+  batch_size: 16
   aug_pd: true
   aug_crop: false
   aug_calib: false
@@ -101,7 +101,11 @@ trainer:
   save_frequency: 1
   save_all: false
   grad_accum_steps: 4
-  precision: bf16_if_supported_else_fp16
+  # The legacy MSDeformAttn CUDA extension and this pretrained MonoDETR stack
+  # are not numerically safe under autocast FP16 (invalid/NaN boxes can reach
+  # the Hungarian matcher on the first batch).  FP32 is the reproducible
+  # default; enable mixed precision only after validating a rebuilt extension.
+  precision: fp32
   save_last_and_best: true
 
 tester:

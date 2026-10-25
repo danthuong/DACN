@@ -330,7 +330,17 @@ class Trainer(object):
                         if flags[int(key[-1])]:
                             print("")
                             flags[int(key[-1])] = False
-                    print("%s: %.2f, " %(key, val), end="")
+                    # Geometry losses operate on normalized image coordinates
+                    # and are commonly below 0.005; two decimals misleadingly
+                    # render healthy non-zero supervision as 0.00.
+                    if key in ('loss_touchpoint', 'loss_horizon_line'):
+                        print("%s: %.6f, " % (key, val), end="")
+                    else:
+                        print("%s: %.2f, " % (key, val), end="")
+                for key in ('touchpoint_valid_count', 'touchpoint_mae_px',
+                            'horizon_center_mae_px'):
+                    if key in metric_values:
+                        print("%s: %.3f, " % (key, metric_values[key]), end="")
                 print("")
                 print("")
 

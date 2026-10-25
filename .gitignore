@@ -5,3 +5,10 @@ outputs/e1_distribution_level/
 __pycache__/
 *.py[cod]
 outputs//Miniconda3-latest-Linux-x86_64.sh
+data/
+
+# Local installers
+/Miniconda3-latest-Linux-x86_64.sh
+
+# Training outputs and checkpoints
+/outputs/

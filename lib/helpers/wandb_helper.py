@@ -54,6 +54,11 @@ class WandbLogger:
             metadata['pretrained_sha256'] = digest.hexdigest()
         tracked_config['run_metadata'] = metadata
         run_id = cfg.get('run_id') or os.environ.get('WANDB_RUN_ID') or None
+        # An empty WANDB_RUN_ID in .env is useful documentation, but recent
+        # W&B SDKs reject it even when wandb.init(id=None) is supplied because
+        # the SDK also reads the environment variable directly.
+        if not run_id:
+            os.environ.pop('WANDB_RUN_ID', None)
         wandb_cache = os.path.join(output_dir, 'wandb-cache')
         os.makedirs(wandb_cache, exist_ok=True)
         os.environ.setdefault('WANDB_CACHE_DIR', wandb_cache)
