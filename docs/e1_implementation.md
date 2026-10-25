@@ -35,14 +35,8 @@ The touchpoint head reads the final query feature of decoder pass 1. It predicts
 four named slots `(LF, RF, RR, LR)` box-relatively in range `[-0.25,1.25]` and
 uses the repository's real six-value `cxcylrtb` box conversion. Supervision uses
 the pass-1 Hungarian assignment, valid Car slots only, and the pseudo-label
-object ID is the original KITTI label-file row. The optional `touch_v2` configs
-compare box-relative predictions against GT-box-relative targets with SmoothL1
-`beta=0.05`; this avoids the vanishingly small gradients produced by the v1
-`beta=1` loss on full-image-normalized coordinates. In v2, touch points outside
-the input image are masked and the touchpoint branch detaches its detector box
-so it cannot improve its loss by moving the detection. The original configs are
-kept unchanged as the v1 control. Default E1 configs disable crop and flip;
-photometric augmentation remains enabled. Depth targets remain physical
+object ID is the original KITTI label-file row. Default E1 configs disable crop
+and flip; photometric augmentation remains enabled. Depth targets remain physical
 camera-Z (`depth_scale: none`).
 
 Four footprint-contact Z values have mean equal to KITTI object centre Z when

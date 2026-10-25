@@ -136,14 +136,9 @@ def make_horizon_heatmap_target(
 
 
 class TouchpointHead(nn.Module):
-    def __init__(self, hidden_dim: int = 256, max_touchpoints: int = 4,
-                 offset_range: Sequence[float] = (-0.25, 1.25)):
+    def __init__(self, hidden_dim: int = 256, max_touchpoints: int = 4):
         super().__init__()
         self.max_touchpoints = max_touchpoints
-        if len(offset_range) != 2 or float(offset_range[0]) >= float(offset_range[1]):
-            raise ValueError('touchpoint.offset_range must be [minimum, maximum]')
-        self.offset_min = float(offset_range[0])
-        self.offset_max = float(offset_range[1])
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -156,9 +151,7 @@ class TouchpointHead(nn.Module):
         raw = self.mlp(query_features).view(
             *query_features.shape[:-1], self.max_touchpoints, 2
         )
-        relative = (
-            (self.offset_max - self.offset_min) * raw.sigmoid()
-            + self.offset_min)
+        relative = 1.5 * raw.sigmoid() - 0.25
         xyxy = box_ops.box_cxcylrtb_to_xyxy(boxes)
         top_left = xyxy[..., None, :2]
         size = (xyxy[..., 2:] - xyxy[..., :2]).clamp_min(1e-6)[..., None, :]
@@ -271,12 +264,7 @@ class GeometryE1(nn.Module):
         mode_cfg = fusion_cfg.get("mode_settings", {})
 
         self.horizon_head = HorizonHead(hidden_dim, int(horizon_cfg.get("fpn_channels", 128)))
-        self.touchpoint_head = TouchpointHead(
-            hidden_dim,
-            int(point_cfg.get("max_touchpoints", 4)),
-            point_cfg.get("offset_range", [-0.25, 1.25]),
-        )
-        self.touchpoint_box_detach = bool(point_cfg.get("box_detach", False))
+        self.touchpoint_head = TouchpointHead(hidden_dim, int(point_cfg.get("max_touchpoints", 4)))
         self.softargmax_temperature = float(horizon_cfg.get("softargmax_temperature", 0.25))
         self.entropy_confidence = bool(horizon_cfg.get("entropy_confidence", True))
         self.camera_height_m = float(plane_cfg.get("camera_height_m", 1.65))
@@ -330,9 +318,7 @@ class GeometryE1(nn.Module):
         image_hw: Tuple[int, int],
         depth_grid_hw: Tuple[int, int],
     ) -> Dict[str, torch.Tensor]:
-        touch_boxes = boxes.detach() if self.touchpoint_box_detach else boxes
-        touch_abs, touch_rel, touch_raw = self.touchpoint_head(
-            query_features, touch_boxes)
+        touch_abs, touch_rel, touch_raw = self.touchpoint_head(query_features, boxes)
         canonical = min(self.num_queries, touch_abs.shape[1])
         touch_canonical = touch_abs[:, :canonical]
         boxes_canonical = boxes[:, :canonical]

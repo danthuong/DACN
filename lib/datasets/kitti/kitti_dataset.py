@@ -86,9 +86,6 @@ class KITTI_Dataset(data.Dataset):
         # required for an E1 training split.
         self.geometry_cfg = cfg.get('geometry_e1') or {}
         self.geometry_enabled = bool(self.geometry_cfg.get('enabled', False))
-        touch_cfg = self.geometry_cfg.get('touchpoint', {})
-        self.touchpoint_require_inside = bool(
-            touch_cfg.get('require_inside_image', False))
         self.pseudo_records = {}
         if self.geometry_enabled:
             pseudo_cfg = self.geometry_cfg.get('pseudo_labels', {})
@@ -360,17 +357,11 @@ class KITTI_Dataset(data.Dataset):
                     point = point_by_name.get(point_name)
                     if not point or not point.get('projection_valid') or point.get('pixel_2d') is None:
                         continue
-                    if self.touchpoint_require_inside and not point.get('inside_image', False):
-                        continue
                     pixel = np.asarray(point['pixel_2d'], dtype=np.float32)
                     if random_flip_flag:
                         pixel[0] = float(img_size[0]) - pixel[0]
                     pixel = affine_transform(pixel, trans)
-                    inside_input = (
-                        0.0 <= pixel[0] < float(self.resolution[0])
-                        and 0.0 <= pixel[1] < float(self.resolution[1]))
-                    if np.isfinite(pixel).all() and (
-                            inside_input or not self.touchpoint_require_inside):
+                    if np.isfinite(pixel).all():
                         touch_points[i, point_index] = pixel / self.resolution
                         touchpoint_valid[i, point_index] = True
 

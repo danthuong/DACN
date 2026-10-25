@@ -1,7 +1,4 @@
-# ninja log v5
-0	3678	1790943892246567161	/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/build/temp.linux-x86_64-cpython-38/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/src/cpu/ms_deform_attn_cpu.o	2eff69136714eabe
-0	11423	1790943899988671083	/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/build/temp.linux-x86_64-cpython-38/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/src/vision.o	6742c11cf95051bb
-4	20516	1790943928953059655	/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/build/temp.linux-x86_64-cpython-38/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/src/cuda/ms_deform_attn_cuda.o	5870023aaedc5b19
-4	1361	1790944282916786472	/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/build/temp.linux-x86_64-cpython-38/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/src/cpu/ms_deform_attn_cpu.o	7f2bf7750e44fc4f
-4	7874	1790944289425873102	/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/build/temp.linux-x86_64-cpython-38/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/src/vision.o	3ba54a7fa4bf52dc
-4	12771	1790944294320938245	/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/build/temp.linux-x86_64-cpython-38/home/ml4u/BKTeam/Duong/monodetr/lib/models/monodetr/ops/src/cuda/ms_deform_attn_cuda.o	6c114306143c6ec3
+# ninja log v7
+5	3432	1792952819545143357	/home/ml4u/BKTeam/Duong/DACN/lib/models/monodetr/ops/build/temp.linux-x86_64-cpython-38/home/ml4u/BKTeam/Duong/DACN/lib/models/monodetr/ops/src/cpu/ms_deform_attn_cpu.o	cb0b72ddb008f49b
+7	18811	1792952819549143263	/home/ml4u/BKTeam/Duong/DACN/lib/models/monodetr/ops/build/temp.linux-x86_64-cpython-38/home/ml4u/BKTeam/Duong/DACN/lib/models/monodetr/ops/src/vision.o	7de8a8c5f5e0c436
+6	26659	1792952819549143263	/home/ml4u/BKTeam/Duong/DACN/lib/models/monodetr/ops/build/temp.linux-x86_64-cpython-38/home/ml4u/BKTeam/Duong/DACN/lib/models/monodetr/ops/src/cuda/ms_deform_attn_cuda.o	349e00e5ba3bf5bd

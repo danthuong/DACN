@@ -294,7 +294,7 @@ class Trainer(object):
                 dn_args=(targets, self.cfg['scalar'], self.cfg['label_noise_scale'], self.cfg['box_noise_scale'], self.cfg['num_patterns'])
             ###
             # train one batch
-            with torch.cuda.amp.autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
+            with torch.cuda.amp.autocast(enabled=self.amp_enabled):
                 outputs = self.model(
                     inputs, calibs, targets, img_sizes, dn_args=dn_args,
                     geometry_calibs=geometry_calibs)
