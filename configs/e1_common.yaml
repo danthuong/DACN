@@ -1,0 +1,134 @@
+extends: monodetr.yaml
+
+random_seed: 444
+
+dataset:
+  root_dir: "${KITTI_ROOT:-data/KITTIDataset}"
+  batch_size: 2
+  aug_pd: true
+  aug_crop: false
+  aug_calib: false
+  random_flip: 0.0
+  random_crop: 0.0
+  depth_scale: none
+  writelist: [Car]
+
+model:
+  group_num: 11
+
+geometry_e1:
+  enabled: true
+  fusion_mode: feature_level
+  pretrained_checkpoint: "${MONODETR_CHECKPOINT:-outputs/monodetr/checkpoint_best_1.pth}"
+  two_pass_decoder: true
+  share_decoder_weights: true
+  pseudo_labels:
+    root: "${PSEUDOLABEL_ROOT:-outputs/geometry_pseudo_labels}"
+    alignment: image_id_and_gt_object_id
+    max_touchpoints: 4
+    no_gt_inputs_at_inference: true
+  horizon:
+    fpn_channels: 128
+    heatmap_stride: 4
+    gaussian_sigma_heatmap_px: 1.5
+    softargmax_temperature: 0.25
+    entropy_confidence: true
+    use_fp32_for_line_fitting: true
+  touchpoint:
+    max_touchpoints: 4
+    class_index: 1
+    predict_box_relative: true
+    offset_range: [-0.25, 1.25]
+    supervise_matched_only: true
+    class_filter: [Car]
+    box_detach: false
+  plane:
+    camera_height_m: "${CAMERA_HEIGHT_M:-1.65}"
+    height_definition: normal_distance
+    min_abs_ray_plane_dot: 0.015
+    valid_min_depth_m: 2.0
+    valid_max_depth_m: 65.0
+    depth_consistency_scale_m: 5.0
+    raycast_fp32: true
+    invalid_geometry_policy: identity_fusion
+  spatial_projection:
+    query_group: first_canonical_group_in_training
+    box_edge_softness_grid_px: 1.25
+    overlap_strategy: normalized_soft_object_weights
+    identity_for_no_coverage: true
+  fusion:
+    initial_alpha: 0.01
+    alpha_min: 0.0
+    alpha_max: 1.0
+    preserve_background_logit: true
+    mode_settings:
+      gaussian_sigma_m: 2.5
+      log_prior_clamp: [-12.0, 0.0]
+  losses:
+    touchpoint_loss_coef: 1.0
+    horizon_heatmap_loss_coef: 1.0
+    horizon_line_loss_coef: 0.5
+    fused_depth_map_loss_coef: 1.0
+    pass1_aux_detection_loss_coef_phase2: 0.10
+    geometric_center_depth_loss_coef: 0.0
+  training:
+    fusion_start_epoch: 8
+    phase1_decoder_passes: 1
+    phase2_decoder_passes: 2
+    detach_geometry: false
+    freeze_pass1: false
+
+optimizer:
+  type: adamw
+  lr: 0.00001
+  weight_decay: 0.0001
+  param_groups:
+    original_monodetr_lr: 0.00001
+    horizon_touchpoint_lr: 0.0001
+    geometry_fusion_lr: 0.0001
+  grad_clip_norm: 0.1
+
+lr_scheduler:
+  type: cos
+  warmup: false
+  decay_rate: 0.1
+  decay_list: []
+
+trainer:
+  max_epoch: 30
+  gpu_ids: '0'
+  pretrain_model: "${MONODETR_CHECKPOINT:-outputs/monodetr/checkpoint_best_1.pth}"
+  save_frequency: 1
+  save_all: false
+  grad_accum_steps: 4
+  precision: bf16_if_supported_else_fp16
+  save_last_and_best: true
+
+tester:
+  output_variant: pass2
+  output_name: pass2
+
+runtime:
+  num_workers: 4
+  geometry_force_fp32: true
+  deterministic_validation: true
+
+validation:
+  split: val
+  every_n_epochs: 1
+  baseline_prediction_dir: outputs/monodetr/outputs/data
+  iou_threshold: 0.5
+  distance_bins_m: [0, 10, 20, 30, 40, 60]
+  export_formats: [json, csv]
+
+logging:
+  log_every_n_steps: 20
+  gradient_norms_every_n_steps: 100
+  wandb:
+    enabled: true
+    project: "${WANDB_PROJECT:-monodetr-gpro3d-e1}"
+    entity: "${WANDB_ENTITY:-}"
+    mode: "${WANDB_MODE:-offline}"
+    log_validation_images: true
+    val_visualization_samples: 8
+

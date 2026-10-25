@@ -1,0 +1,29 @@
+{
+  "models": [
+    {
+      "id": "monodetr",
+      "label": "Baseline MonoDETR",
+      "color": "#ff9f43",
+      "format": "kitti",
+      "prediction_dir": "outputs/monodetr/outputs/data"
+    },
+    {
+      "id": "e1_feature",
+      "label": "E1 Feature",
+      "color": "#4bd8ff",
+      "format": "kitti",
+      "prediction_dir": "outputs/e1_feature_level/monodetr/outputs/pass2/data",
+      "artifact_dir": "outputs/e1_feature_level/monodetr/outputs/pass2/artifacts",
+      "metrics_path": "outputs/e1_feature_level/validation/val_metrics.json"
+    },
+    {
+      "id": "e1_distribution",
+      "label": "E1 Distribution",
+      "color": "#b879ff",
+      "format": "kitti",
+      "prediction_dir": "outputs/e1_distribution_level/monodetr/outputs/pass2/data",
+      "artifact_dir": "outputs/e1_distribution_level/monodetr/outputs/pass2/artifacts",
+      "metrics_path": "outputs/e1_distribution_level/validation/val_metrics.json"
+    }
+  ]
+}

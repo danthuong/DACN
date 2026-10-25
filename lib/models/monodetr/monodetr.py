@@ -19,6 +19,11 @@ from .depth_predictor import DepthPredictor
 from .depth_predictor.ddn_loss import DDNLoss
 from lib.losses.focal_loss import sigmoid_focal_loss
 from .dn_components import prepare_for_dn, dn_post_process, compute_dn_loss
+from .geometry_e1 import (
+    GeometryE1,
+    horizon_focal_loss,
+    make_horizon_heatmap_target,
+)
 
 
 def _get_clones(module, N):
@@ -28,7 +33,8 @@ def _get_clones(module, N):
 class MonoDETR(nn.Module):
     """ This is the MonoDETR module that performs monocualr 3D object detection """
     def __init__(self, backbone, depthaware_transformer, depth_predictor, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False, init_box=False, use_dab=False, group_num=11, two_stage_dino=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False, init_box=False, use_dab=False,
+                 group_num=11, two_stage_dino=False, geometry_cfg=None):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -48,6 +54,7 @@ class MonoDETR(nn.Module):
         hidden_dim = depthaware_transformer.d_model
         self.hidden_dim = hidden_dim
         self.num_feature_levels = num_feature_levels
+        self.group_num = group_num
         self.two_stage_dino = two_stage_dino
         self.label_enc = nn.Embedding(num_classes + 1, hidden_dim - 1)  # # for indicator
         # prediction heads
@@ -103,6 +110,18 @@ class MonoDETR(nn.Module):
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
         self.num_classes = num_classes
+        self.geometry_cfg = geometry_cfg or {}
+        self.geometry_enabled = bool(self.geometry_cfg.get('enabled', False))
+        self.fusion_start_epoch = int(
+            self.geometry_cfg.get('training', {}).get('fusion_start_epoch', 8))
+        self.current_epoch = 0
+        if self.geometry_enabled:
+            self.geometry_e1 = GeometryE1(
+                self.geometry_cfg,
+                hidden_dim,
+                num_queries,
+                self.depth_predictor.depth_bin_values,
+            )
 
         if self.two_stage_dino:        
             _class_embed = nn.Linear(hidden_dim, num_classes)
@@ -147,14 +166,102 @@ class MonoDETR(nn.Module):
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
 
-    def forward(self, images, calibs, targets, img_sizes, dn_args=None):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
-               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
-        """
+    def set_epoch(self, epoch):
+        self.current_epoch = int(epoch)
 
+    def _query_embeddings(self):
+        if self.two_stage or self.two_stage_dino:
+            return None
+        if self.use_dab:
+            if self.training:
+                tgt_embed = self.tgt_embed.weight
+                refanchor = self.refpoint_embed.weight
+            else:
+                tgt_embed = self.tgt_embed.weight[:self.num_queries]
+                refanchor = self.refpoint_embed.weight[:self.num_queries]
+            return torch.cat((tgt_embed, refanchor), dim=1)
+        if self.training:
+            return self.query_embed.weight
+        return self.query_embed.weight[:self.num_queries]
+
+    def _input_frame_calibration(self, images, calibs, img_sizes, geometry_calibs):
+        if geometry_calibs is not None:
+            return geometry_calibs
+        # Resize-only fallback. E1 configs disable random crop/flip; callers
+        # with geometric augmentation must supply the exact transformed P2.
+        p2 = calibs.clone()
+        scale_x = float(images.shape[-1]) / img_sizes[:, 0].to(p2.dtype)
+        scale_y = float(images.shape[-2]) / img_sizes[:, 1].to(p2.dtype)
+        p2[:, 0] = p2[:, 0] * scale_x[:, None]
+        p2[:, 1] = p2[:, 1] * scale_y[:, None]
+        return p2
+
+    def _decode_detection_heads(self, transformer_outputs, weighted_depth,
+                                calibs, img_sizes, depth_map_logits):
+        (hs, init_reference, inter_references, inter_references_dim,
+         enc_outputs_class, enc_outputs_coord_unact) = transformer_outputs
+        outputs_coords, outputs_classes = [], []
+        outputs_3d_dims, outputs_depths, outputs_angles = [], [], []
+
+        for lvl in range(hs.shape[0]):
+            reference = init_reference if lvl == 0 else inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            tmp = self.bbox_embed[lvl](hs[lvl])
+            if reference.shape[-1] == 6:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+            outputs_coords.append(outputs_coord)
+            outputs_classes.append(self.class_embed[lvl](hs[lvl]))
+
+            size3d = inter_references_dim[lvl]
+            outputs_3d_dims.append(size3d)
+            box2d_height_norm = outputs_coord[:, :, 4] + outputs_coord[:, :, 5]
+            box2d_height = torch.clamp(
+                box2d_height_norm * img_sizes[:, 1:2], min=1.0)
+            depth_geo = size3d[:, :, 0] / box2d_height * calibs[:, 0, 0].unsqueeze(1)
+            depth_reg = self.depth_embed[lvl](hs[lvl])
+            outputs_center3d = ((outputs_coord[..., :2] - 0.5) * 2).unsqueeze(2).detach()
+            depth_map = F.grid_sample(
+                weighted_depth.unsqueeze(1), outputs_center3d,
+                mode='bilinear', align_corners=True).squeeze(1)
+            depth_ave = torch.cat([
+                ((1. / (depth_reg[:, :, 0:1].sigmoid() + 1e-6) - 1.)
+                 + depth_geo.unsqueeze(-1) + depth_map) / 3,
+                depth_reg[:, :, 1:2]], -1)
+            outputs_depths.append(depth_ave)
+            outputs_angles.append(self.angle_embed[lvl](hs[lvl]))
+
+        outputs_coord = torch.stack(outputs_coords)
+        outputs_class = torch.stack(outputs_classes)
+        outputs_3d_dim = torch.stack(outputs_3d_dims)
+        outputs_depth = torch.stack(outputs_depths)
+        outputs_angle = torch.stack(outputs_angles)
+        out = {
+            'pred_logits': outputs_class[-1],
+            'pred_boxes': outputs_coord[-1],
+            'pred_3d_dim': outputs_3d_dim[-1],
+            'pred_depth': outputs_depth[-1],
+            'pred_angle': outputs_angle[-1],
+            'pred_depth_map_logits': depth_map_logits,
+            '_query_features': hs[-1],
+        }
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(
+                outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth)
+        if self.two_stage:
+            out['enc_outputs'] = {
+                'pred_logits': enc_outputs_class,
+                'pred_boxes': enc_outputs_coord_unact.sigmoid(),
+            }
+        return out
+
+    def forward(self, images, calibs, targets, img_sizes, dn_args=None,
+                geometry_calibs=None, force_phase=None):
+        """Run baseline MonoDETR or the E1 one/two-pass geometry pipeline."""
         features, pos = self.backbone(images)
-
         srcs = []
         masks = []
         for l, feat in enumerate(features):
@@ -177,110 +284,98 @@ class MonoDETR(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
-        if self.two_stage:
-            query_embeds = None
-        elif self.use_dab:
-            if self.training:
-                tgt_all_embed=tgt_embed = self.tgt_embed.weight           # nq, 256
-                refanchor = self.refpoint_embed.weight      # nq, 4
-                query_embeds = torch.cat((tgt_embed, refanchor), dim=1) 
-                
+        query_embeds = self._query_embeddings()
+        depth_source = self.depth_predictor.extract_depth_feature(srcs)
+        original_depth_logits = self.depth_predictor.depth_classifier(depth_source)
+        original_depth_base = self.depth_predictor.encode_depth_feature(
+            depth_source, masks[1], pos[1])
+        original_weighted_depth, original_depth_position = self.depth_predictor.depth_from_logits(
+            original_depth_logits)
+        original_depth_memory = original_depth_base + original_depth_position
+
+        phase2 = False
+        if self.geometry_enabled:
+            if force_phase is not None:
+                phase2 = int(force_phase) == 2
             else:
-                tgt_all_embed=tgt_embed = self.tgt_embed.weight[:self.num_queries]         
-                refanchor = self.refpoint_embed.weight[:self.num_queries]  
-                query_embeds = torch.cat((tgt_embed, refanchor), dim=1) 
-        elif self.two_stage_dino:
-            query_embeds = None
+                phase2 = (not self.training) or self.current_epoch >= self.fusion_start_epoch
+
+        if phase2:
+            pass1_transformer, visual_cache = self.depthaware_transformer(
+                srcs, masks, pos, query_embeds, original_depth_memory,
+                original_depth_position, return_visual_cache=True)
         else:
-            if self.training:
-                query_embeds = self.query_embed.weight
-            else:
-                # only use one group in inference
-                query_embeds = self.query_embed.weight[:self.num_queries]
+            pass1_transformer = self.depthaware_transformer(
+                srcs, masks, pos, query_embeds, original_depth_memory,
+                original_depth_position)
+            visual_cache = None
 
-        pred_depth_map_logits, depth_pos_embed, weighted_depth, depth_pos_embed_ip = self.depth_predictor(srcs, masks[1], pos[1])
-        
-        hs, init_reference, inter_references, inter_references_dim, enc_outputs_class, enc_outputs_coord_unact = self.depthaware_transformer(
-            srcs, masks, pos, query_embeds, depth_pos_embed, depth_pos_embed_ip)#, attn_mask)
+        pass1 = self._decode_detection_heads(
+            pass1_transformer, original_weighted_depth, calibs, img_sizes,
+            original_depth_logits)
+        if not self.geometry_enabled:
+            pass1.pop('_query_features')
+            return pass1
 
-        outputs_coords = []
-        outputs_classes = []
-        outputs_3d_dims = []
-        outputs_depths = []
-        outputs_angles = []
+        image_hw = (images.shape[-2], images.shape[-1])
+        horizon_logits, horizon_line, horizon_rows, horizon_confidence = (
+            self.geometry_e1.predict_horizon(srcs, image_hw))
+        p2_input = self._input_frame_calibration(
+            images, calibs, img_sizes, geometry_calibs)
+        geometry = self.geometry_e1.predict_geometry(
+            pass1['_query_features'], pass1['pred_boxes'], pass1['pred_logits'],
+            horizon_line, horizon_confidence, p2_input, image_hw,
+            original_depth_logits.shape[-2:])
+        pass1.update({
+            'pred_horizon_logits': horizon_logits,
+            'pred_horizon_line': horizon_line,
+            'pred_horizon_rows': horizon_rows,
+            'pred_horizon_confidence': horizon_confidence,
+            'pred_touchpoints': geometry['touchpoints_abs'],
+            'pred_touchpoints_rel': geometry['touchpoints_rel'],
+            'geometry': geometry,
+            'e1_phase': 1,
+        })
+        pass1.pop('_query_features')
+        if not phase2:
+            return pass1
 
-        for lvl in range(hs.shape[0]):
-            if lvl == 0:
-                reference = init_reference
-            else:
-                reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
+        if self.geometry_e1.mode == 'feature_level':
+            fused_source = self.geometry_e1.fuse_feature(depth_source, geometry)
+            fused_depth_logits = self.depth_predictor.depth_classifier(fused_source)
+            fused_depth_base = self.depth_predictor.encode_depth_feature(
+                fused_source, masks[1], pos[1])
+            fused_weighted_depth, fused_depth_position = self.depth_predictor.depth_from_logits(
+                fused_depth_logits)
+            fused_depth_memory = fused_depth_base + fused_depth_position
+        else:
+            fused_depth_logits = self.geometry_e1.fuse_distribution(
+                original_depth_logits, geometry)
+            fused_weighted_depth, fused_depth_position = self.depth_predictor.depth_from_logits(
+                fused_depth_logits)
+            fused_depth_memory = original_depth_base + fused_depth_position
 
-            tmp = self.bbox_embed[lvl](hs[lvl])
-            if reference.shape[-1] == 6:
-                tmp += reference
-            else:
-                assert reference.shape[-1] == 2
-                tmp[..., :2] += reference
-
-          
-            # 3d center + 2d box
-            outputs_coord = tmp.sigmoid()
-            outputs_coords.append(outputs_coord)
-
-            # classes
-            outputs_class = self.class_embed[lvl](hs[lvl])
-            outputs_classes.append(outputs_class)
-
-            # 3D sizes
-            size3d = inter_references_dim[lvl]
-            outputs_3d_dims.append(size3d)
-
-            # depth_geo
-            box2d_height_norm = outputs_coord[:, :, 4] + outputs_coord[:, :, 5]
-            box2d_height = torch.clamp(box2d_height_norm * img_sizes[:, 1: 2], min=1.0)
-            depth_geo = size3d[:, :, 0] / box2d_height * calibs[:, 0, 0].unsqueeze(1)
-
-            # depth_reg
-            depth_reg = self.depth_embed[lvl](hs[lvl])
-
-            # depth_map
-            outputs_center3d = ((outputs_coord[..., :2] - 0.5) * 2).unsqueeze(2).detach()
-            depth_map = F.grid_sample(
-                weighted_depth.unsqueeze(1),
-                outputs_center3d,
-                mode='bilinear',
-                align_corners=True).squeeze(1)
-
-            # depth average + sigma
-            depth_ave = torch.cat([((1. / (depth_reg[:, :, 0: 1].sigmoid() + 1e-6) - 1.) + depth_geo.unsqueeze(-1) + depth_map) / 3,
-                                    depth_reg[:, :, 1: 2]], -1)
-            outputs_depths.append(depth_ave)
-
-            # angles
-            outputs_angle = self.angle_embed[lvl](hs[lvl])
-            outputs_angles.append(outputs_angle)
-
-        outputs_coord = torch.stack(outputs_coords)
-        outputs_class = torch.stack(outputs_classes)
-        outputs_3d_dim = torch.stack(outputs_3d_dims)
-        outputs_depth = torch.stack(outputs_depths)
-        outputs_angle = torch.stack(outputs_angles)
-  
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
-        out['pred_3d_dim'] = outputs_3d_dim[-1]
-        out['pred_depth'] = outputs_depth[-1]
-        out['pred_angle'] = outputs_angle[-1]
-        out['pred_depth_map_logits'] = pred_depth_map_logits
-
-        if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(
-                outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth)
-
-        if self.two_stage:
-            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
-            out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
-        return out #, mask_dict
+        pass2_transformer = self.depthaware_transformer.decode_from_memory(
+            visual_cache, query_embeds, fused_depth_memory, fused_depth_position)
+        out = self._decode_detection_heads(
+            pass2_transformer, fused_weighted_depth, calibs, img_sizes,
+            original_depth_logits)
+        out.update({
+            'pred_fused_depth_map_logits': fused_depth_logits,
+            'original_depth_map_logits': original_depth_logits,
+            'pred_horizon_logits': horizon_logits,
+            'pred_horizon_line': horizon_line,
+            'pred_horizon_rows': horizon_rows,
+            'pred_horizon_confidence': horizon_confidence,
+            'pred_touchpoints': geometry['touchpoints_abs'],
+            'pred_touchpoints_rel': geometry['touchpoints_rel'],
+            'geometry': geometry,
+            'pass1_outputs': pass1,
+            'fusion_alpha': self.geometry_e1.alpha,
+            'e1_phase': 2,
+        })
+        out.pop('_query_features')
+        return out
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord, outputs_3d_dim, outputs_angle, outputs_depth):
@@ -299,7 +394,8 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses, group_num=11):
+    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses,
+                 group_num=11, geometry_cfg=None):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -316,6 +412,16 @@ class SetCriterion(nn.Module):
         self.focal_alpha = focal_alpha
         self.ddn_loss = DDNLoss()  # for depth map
         self.group_num = group_num
+        self.geometry_cfg = geometry_cfg or {}
+        self.geometry_enabled = bool(self.geometry_cfg.get('enabled', False))
+        horizon_cfg = self.geometry_cfg.get('horizon', {})
+        touch_cfg = self.geometry_cfg.get('touchpoint', {})
+        self.horizon_sigma = float(horizon_cfg.get('gaussian_sigma_heatmap_px', 1.5))
+        self.horizon_stride = int(horizon_cfg.get('heatmap_stride', 4))
+        self.touchpoint_class_index = int(touch_cfg.get('class_index', 1))
+        self.pass1_aux_detection_coef = float(
+            self.geometry_cfg.get('losses', {}).get(
+                'pass1_aux_detection_loss_coef_phase2', 0.0))
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
@@ -344,6 +450,10 @@ class SetCriterion(nn.Module):
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
 
+    @staticmethod
+    def _has_matches(indices):
+        return any(source.numel() > 0 for source, _ in indices)
+
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
         """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
@@ -359,7 +469,8 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_3dcenter(self, outputs, targets, indices, num_boxes):
-        
+        if not self._has_matches(indices):
+            return {'loss_center': outputs['pred_boxes'].sum() * 0.0}
         idx = self._get_src_permutation_idx(indices)
         src_3dcenter = outputs['pred_boxes'][:, :, 0: 2][idx]
         target_3dcenter = torch.cat([t['boxes_3d'][:, 0: 2][i] for t, (_, i) in zip(targets, indices)], dim=0)
@@ -370,7 +481,9 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
-        
+        if not self._has_matches(indices):
+            zero = outputs['pred_boxes'].sum() * 0.0
+            return {'loss_bbox': zero, 'loss_giou': zero}
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         src_2dboxes = outputs['pred_boxes'][:, :, 2: 6][idx]
@@ -391,7 +504,8 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_depths(self, outputs, targets, indices, num_boxes):  
-
+        if not self._has_matches(indices):
+            return {'loss_depth': outputs['pred_depth'].sum() * 0.0}
         idx = self._get_src_permutation_idx(indices)
    
         src_depths = outputs['pred_depth'][idx]
@@ -404,7 +518,8 @@ class SetCriterion(nn.Module):
         return losses  
     
     def loss_dims(self, outputs, targets, indices, num_boxes):  
-
+        if not self._has_matches(indices):
+            return {'loss_dim': outputs['pred_3d_dim'].sum() * 0.0}
         idx = self._get_src_permutation_idx(indices)
         src_dims = outputs['pred_3d_dim'][idx]
         target_dims = torch.cat([t['size_3d'][i] for t, (_, i) in zip(targets, indices)], dim=0)
@@ -420,7 +535,8 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_angles(self, outputs, targets, indices, num_boxes):  
-
+        if not self._has_matches(indices):
+            return {'loss_angle': outputs['pred_angle'].sum() * 0.0}
         idx = self._get_src_permutation_idx(indices)
         heading_input = outputs['pred_angle'][idx]
         target_heading_cls = torch.cat([t['heading_bin'][i] for t, (_, i) in zip(targets, indices)], dim=0)
@@ -436,7 +552,10 @@ class SetCriterion(nn.Module):
 
         # regression loss
         heading_input_res = heading_input[:, 12:24]
-        cls_onehot = torch.zeros(heading_target_cls.shape[0], 12).cuda().scatter_(dim=1, index=heading_target_cls.view(-1, 1), value=1)
+        cls_onehot = torch.zeros(
+            heading_target_cls.shape[0], 12,
+            device=heading_input.device, dtype=heading_input.dtype
+        ).scatter_(dim=1, index=heading_target_cls.view(-1, 1), value=1)
         heading_input_res = torch.sum(heading_input_res * cls_onehot, 1)
         reg_loss = F.l1_loss(heading_input_res, heading_target_res, reduction='none')
         
@@ -447,17 +566,128 @@ class SetCriterion(nn.Module):
 
     def loss_depth_map(self, outputs, targets, indices, num_boxes):
         depth_map_logits = outputs['pred_depth_map_logits']
+        return self._depth_map_loss(depth_map_logits, targets, 'loss_depth_map')
 
+    def _depth_map_loss(self, depth_map_logits, targets, loss_name):
         num_gt_per_img = [len(t['boxes']) for t in targets]
-        gt_boxes2d = torch.cat([t['boxes'] for t in targets], dim=0) * torch.tensor([80, 24, 80, 24], device='cuda')
+        height, width = depth_map_logits.shape[-2:]
+        gt_boxes2d = torch.cat([t['boxes'] for t in targets], dim=0) * torch.tensor(
+            [width, height, width, height],
+            device=depth_map_logits.device,
+            dtype=depth_map_logits.dtype)
         gt_boxes2d = box_ops.box_cxcywh_to_xyxy(gt_boxes2d)
         gt_center_depth = torch.cat([t['depth'] for t in targets], dim=0).squeeze(dim=1)
-        
-        losses = dict()
-
-        losses["loss_depth_map"] = self.ddn_loss(
+        return {loss_name: self.ddn_loss(
             depth_map_logits, gt_boxes2d, num_gt_per_img, gt_center_depth)
-        return losses
+        }
+
+    def loss_fused_depth_map(self, outputs, targets, indices, num_boxes):
+        logits = outputs.get('pred_fused_depth_map_logits')
+        if logits is None:
+            return {'loss_fused_depth_map': outputs['pred_depth_map_logits'].sum() * 0.0}
+        return self._depth_map_loss(logits, targets, 'loss_fused_depth_map')
+
+    def loss_horizon(self, outputs, targets, indices, num_boxes):
+        logits = outputs['pred_horizon_logits']
+        predicted_line = outputs['pred_horizon_line']
+        target_line = torch.stack([target['horizon_line'] for target in targets]).to(logits)
+        valid = torch.stack([target['horizon_valid'] for target in targets]).bool().to(logits.device)
+        input_hw = (
+            int(logits.shape[-2] * self.horizon_stride),
+            int(logits.shape[-1] * self.horizon_stride),
+        )
+        target_heatmap, target_mask = make_horizon_heatmap_target(
+            target_line, valid, logits.shape[-2:], input_hw, self.horizon_sigma)
+        heatmap_loss = horizon_focal_loss(logits, target_heatmap, target_mask)
+        if bool(valid.any()):
+            input_h, input_w = input_hw
+            center_u = (input_w - 1.0) / 2.0
+            pred_stable = torch.stack((
+                predicted_line[:, 0] * input_w / input_h,
+                (predicted_line[:, 0] * center_u + predicted_line[:, 1]) / input_h,
+            ), dim=-1)
+            target_stable = torch.stack((
+                target_line[:, 0] * input_w / input_h,
+                (target_line[:, 0] * center_u + target_line[:, 1]) / input_h,
+            ), dim=-1)
+            line_loss = F.smooth_l1_loss(
+                pred_stable[valid], target_stable[valid], reduction='mean')
+        else:
+            line_loss = predicted_line.sum() * 0.0
+        if bool(valid.any()):
+            slope_error = (predicted_line[valid, 0] - target_line[valid, 0]).abs().mean()
+            center_error = (
+                predicted_line[valid, 0] * center_u + predicted_line[valid, 1]
+                - target_line[valid, 0] * center_u - target_line[valid, 1]
+            ).abs().mean()
+        else:
+            slope_error = predicted_line.sum() * 0.0
+            center_error = predicted_line.sum() * 0.0
+        return {
+            'loss_horizon_heatmap': heatmap_loss,
+            'loss_horizon_line': line_loss,
+            'horizon_slope_mae': slope_error.detach(),
+            'horizon_center_mae_px': center_error.detach(),
+        }
+
+    def loss_touchpoints(self, outputs, targets, indices, num_boxes):
+        source_index = self._get_src_permutation_idx(indices)
+        predicted = outputs['pred_touchpoints'][source_index]
+        target_points = torch.cat([
+            target['touch_points'][target_indices]
+            for target, (_, target_indices) in zip(targets, indices)
+        ], dim=0)
+        valid = torch.cat([
+            target['touchpoint_valid'][target_indices]
+            for target, (_, target_indices) in zip(targets, indices)
+        ], dim=0).bool()
+        labels = torch.cat([
+            target['labels'][target_indices]
+            for target, (_, target_indices) in zip(targets, indices)
+        ], dim=0).long()
+        valid &= labels[:, None] == self.touchpoint_class_index
+        valid_count = valid.sum()
+        if int(valid_count.item()) == 0:
+            zero = predicted.sum() * 0.0
+            return {'loss_touchpoint': zero, 'touchpoint_mae_px': zero.detach()}
+        difference = predicted - target_points
+        loss = F.smooth_l1_loss(
+            predicted[valid], target_points[valid], reduction='sum') / valid_count
+        input_h = outputs['pred_horizon_logits'].shape[-2] * self.horizon_stride
+        input_w = outputs['pred_horizon_logits'].shape[-1] * self.horizon_stride
+        pixel_error = (difference * difference.new_tensor([input_w, input_h])).abs()
+        pixel_mae = pixel_error[valid].mean().detach()
+        return {'loss_touchpoint': loss, 'touchpoint_mae_px': pixel_mae}
+
+    def loss_geometry_metrics(self, outputs, targets, indices, num_boxes):
+        geometry = outputs.get('geometry')
+        if geometry is None:
+            zero = outputs['pred_depth'].sum() * 0.0
+            return {'geometry_depth_mae_m': zero.detach(),
+                    'geometry_valid_matched_ratio': zero.detach()}
+        source_batch, source_query = self._get_src_permutation_idx(indices)
+        target_depths = torch.cat([
+            target['depth'][target_indices]
+            for target, (_, target_indices) in zip(targets, indices)
+        ], dim=0).reshape(-1)
+        canonical = geometry['object_depth'].shape[1]
+        in_canonical = source_query < canonical
+        source_batch = source_batch[in_canonical]
+        source_query = source_query[in_canonical]
+        target_depths = target_depths[in_canonical]
+        if source_query.numel() == 0:
+            zero = geometry['object_depth'].sum() * 0.0
+            return {'geometry_depth_mae_m': zero.detach(),
+                    'geometry_valid_matched_ratio': zero.detach()}
+        valid = geometry['object_valid'][source_batch, source_query]
+        valid_ratio = valid.float().mean()
+        if bool(valid.any()):
+            predicted = geometry['object_depth'][source_batch, source_query]
+            mae = (predicted[valid] - target_depths[valid]).abs().mean()
+        else:
+            mae = geometry['object_depth'].sum() * 0.0
+        return {'geometry_depth_mae_m': mae.detach(),
+                'geometry_valid_matched_ratio': valid_ratio.detach()}
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
@@ -482,6 +712,10 @@ class SetCriterion(nn.Module):
             'angles': self.loss_angles,
             'center': self.loss_3dcenter,
             'depth_map': self.loss_depth_map,
+            'fused_depth_map': self.loss_fused_depth_map,
+            'horizon': self.loss_horizon,
+            'touchpoints': self.loss_touchpoints,
+            'geometry_metrics': self.loss_geometry_metrics,
         }
 
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -510,16 +744,25 @@ class SetCriterion(nn.Module):
         # Compute all the requested losses
 
         losses = {}
+        pass1_indices = None
+        if 'pass1_outputs' in outputs:
+            pass1_indices = self.matcher(
+                outputs['pass1_outputs'], targets, group_num=group_num)
         for loss in self.losses:
             #ipdb.set_trace()
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+            selected_indices = (
+                pass1_indices if loss in ('touchpoints', 'geometry_metrics')
+                and pass1_indices is not None else indices)
+            losses.update(self.get_loss(
+                loss, outputs, targets, selected_indices, num_boxes))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices = self.matcher(aux_outputs, targets, group_num=group_num)
                 for loss in self.losses:
-                    if loss == 'depth_map':
+                    if loss in ('depth_map', 'fused_depth_map', 'horizon', 'touchpoints',
+                                'geometry_metrics'):
                         # Intermediate masks losses are too costly to compute, we ignore them.
                         continue
                     kwargs = {}
@@ -529,6 +772,22 @@ class SetCriterion(nn.Module):
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+
+        # Phase 2 may retain a low-weight stabilizing loss on the final layer
+        # of pass 1. The original depth-map loss is intentionally excluded: it
+        # is already computed exactly once from original logits above.
+        if self.pass1_aux_detection_coef > 0 and 'pass1_outputs' in outputs:
+            pass1 = outputs['pass1_outputs']
+            if pass1_indices is None:
+                pass1_indices = self.matcher(pass1, targets, group_num=group_num)
+            for loss in ('labels', 'boxes', 'depths', 'dims', 'angles', 'center'):
+                kwargs = {'log': False} if loss == 'labels' else {}
+                values = self.get_loss(
+                    loss, pass1, targets, pass1_indices, num_boxes, **kwargs)
+                for key, value in values.items():
+                    if key == 'class_error':
+                        continue
+                    losses['loss_pass1_' + key.replace('loss_', '', 1)] = value
         return losses
 
 
@@ -569,7 +828,9 @@ def build(cfg):
         two_stage=cfg['two_stage'],
         init_box=cfg['init_box'],
         use_dab = cfg['use_dab'],
-        two_stage_dino=cfg['two_stage_dino'])
+        group_num=cfg.get('group_num', 11),
+        two_stage_dino=cfg['two_stage_dino'],
+        geometry_cfg=cfg.get('geometry_e1'))
 
     # matcher
     matcher = build_matcher(cfg)
@@ -582,6 +843,19 @@ def build(cfg):
     weight_dict['loss_depth'] = cfg['depth_loss_coef']
     weight_dict['loss_center'] = cfg['3dcenter_loss_coef']
     weight_dict['loss_depth_map'] = cfg['depth_map_loss_coef']
+    geometry_cfg = cfg.get('geometry_e1') or {}
+    if geometry_cfg.get('enabled', False):
+        geometry_losses = geometry_cfg.get('losses', {})
+        weight_dict['loss_touchpoint'] = geometry_losses.get('touchpoint_loss_coef', 1.0)
+        weight_dict['loss_horizon_heatmap'] = geometry_losses.get('horizon_heatmap_loss_coef', 1.0)
+        weight_dict['loss_horizon_line'] = geometry_losses.get('horizon_line_loss_coef', 0.5)
+        weight_dict['loss_fused_depth_map'] = geometry_losses.get('fused_depth_map_loss_coef', 1.0)
+        pass1_coef = geometry_losses.get('pass1_aux_detection_loss_coef_phase2', 0.0)
+        if pass1_coef > 0:
+            for key in ('loss_ce', 'loss_bbox', 'loss_giou', 'loss_dim',
+                        'loss_angle', 'loss_depth', 'loss_center'):
+                weight_dict['loss_pass1_' + key.replace('loss_', '', 1)] = (
+                    weight_dict[key] * pass1_coef)
     
     # dn loss
     if cfg['use_dn']:
@@ -594,19 +868,29 @@ def build(cfg):
     # TODO this is a hack
     if cfg['aux_loss']:
         aux_weight_dict = {}
+        auxiliary_base_weights = {
+            key: value for key, value in weight_dict.items()
+            if key not in ('loss_depth_map', 'loss_fused_depth_map',
+                           'loss_touchpoint', 'loss_horizon_heatmap',
+                           'loss_horizon_line') and not key.startswith('loss_pass1_')
+        }
         for i in range(cfg['dec_layers'] - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
-        aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
+            aux_weight_dict.update({k + f'_{i}': v for k, v in auxiliary_base_weights.items()})
+        aux_weight_dict.update({k + f'_enc': v for k, v in auxiliary_base_weights.items()})
         weight_dict.update(aux_weight_dict)
 
     losses = ['labels', 'boxes', 'cardinality', 'depths', 'dims', 'angles', 'center', 'depth_map']
+    if geometry_cfg.get('enabled', False):
+        losses.extend(['fused_depth_map', 'horizon', 'touchpoints', 'geometry_metrics'])
     
     criterion = SetCriterion(
         cfg['num_classes'],
         matcher=matcher,
         weight_dict=weight_dict,
         focal_alpha=cfg['focal_alpha'],
-        losses=losses)
+        losses=losses,
+        group_num=cfg.get('group_num', 11),
+        geometry_cfg=geometry_cfg)
 
     device = torch.device(cfg['device'])
     criterion.to(device)

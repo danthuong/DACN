@@ -54,41 +54,39 @@ class DepthPredictor(nn.Module):
         self.depth_pos_embed = nn.Embedding(int(self.depth_max) + 1, 256)
 
     def forward(self, feature, mask, pos):
-       
-        assert len(feature) == 4
-
-        # foreground depth map
-        #ipdb.set_trace()
-        src_16 = self.proj(feature[1])
-        src_32 = self.upsample(F.interpolate(feature[2], size=src_16.shape[-2:], mode='bilinear'))
-        src_8 = self.downsample(feature[0])
-        #new_add
-        # src_8 = self.proj(feature[0])
-        # src_16 = self.upsample(F.interpolate(feature[1], size=src_8.shape[-2:], mode='bilinear'))
-        # src_32 = self.upsample(F.interpolate(feature[2], size=src_8.shape[-2:], mode='bilinear'))
-        ####
-        src = (src_8 + src_16 + src_32) / 3
-
-        src = self.depth_head(src)
-        #ipdb.set_trace()
+        src = self.extract_depth_feature(feature)
         depth_logits = self.depth_classifier(src)
+        depth_embed_base = self.encode_depth_feature(src, mask, pos)
+        weighted_depth, depth_pos_embed_ip = self.depth_from_logits(depth_logits)
+        depth_embed = depth_embed_base + depth_pos_embed_ip
+        return depth_logits, depth_embed, weighted_depth, depth_pos_embed_ip
 
+    def extract_depth_feature(self, feature):
+        """Fuse the visual pyramid into the stride-16 latent depth feature."""
+        assert len(feature) == 4
+        src_16 = self.proj(feature[1])
+        src_32 = self.upsample(F.interpolate(
+            feature[2], size=src_16.shape[-2:], mode='bilinear', align_corners=False))
+        src_8 = self.downsample(feature[0])
+        src = (src_8 + src_16 + src_32) / 3
+        return self.depth_head(src)
+
+    def depth_from_logits(self, depth_logits):
+        """Compute weighted depth and its differentiable positional embedding."""
         depth_probs = F.softmax(depth_logits, dim=1)
         weighted_depth = (depth_probs * self.depth_bin_values.reshape(1, -1, 1, 1)).sum(dim=1)
-        #ipdb.set_trace()
-        # depth embeddings with depth positional encodings
-        B, C, H, W = src.shape
-        src = src.flatten(2).permute(2, 0, 1)
-        mask = mask.flatten(1)
-        pos = pos.flatten(2).permute(2, 0, 1)
-
-        depth_embed = self.depth_encoder(src, mask, pos)
-        depth_embed = depth_embed.permute(1, 2, 0).reshape(B, C, H, W)
-        #ipdb.set_trace()
         depth_pos_embed_ip = self.interpolate_depth_embed(weighted_depth)
-        depth_embed = depth_embed + depth_pos_embed_ip
+        return weighted_depth, depth_pos_embed_ip
 
-        return depth_logits, depth_embed, weighted_depth, depth_pos_embed_ip
+    def encode_depth_feature(self, src, mask, pos):
+        """Encode latent depth features before adding metric depth position."""
+        B, C, H, W = src.shape
+        src_flat = src.flatten(2).permute(2, 0, 1)
+        mask_flat = mask.flatten(1)
+        pos_flat = pos.flatten(2).permute(2, 0, 1)
+        depth_embed = self.depth_encoder(src_flat, mask_flat, pos_flat)
+        depth_embed = depth_embed.permute(1, 2, 0).reshape(B, C, H, W)
+        return depth_embed
 
     def interpolate_depth_embed(self, depth):
         depth = depth.clamp(min=0, max=self.depth_max)

@@ -130,6 +130,41 @@ The best checkpoint will be evaluated as default. You can change it at "tester/c
 
     bash test.sh configs/monodetr.yaml
 
+### Geometry pseudo-labels and local dashboard
+
+The end-to-end MonoDETR × GPro3D E1 implementation, its feature/distribution
+ablation configs, W&B setup, resume/export commands and fair depth evaluator are
+documented in [`docs/e1_implementation.md`](docs/e1_implementation.md). The
+local-code/checkpoint/tensor audit is in
+[`docs/e1_repo_audit.md`](docs/e1_repo_audit.md).
+
+Generate GPro3D-style wheel-contact candidates, a fitted ground plane, and its
+horizon line from KITTI ground truth (CPU only):
+
+    python generate_geometry_pseudo_labels.py --split val
+
+The configurable `k_l` and `k_w` ratios default to `0.65` and `0.85`; set
+verified dataset-specific values with `--k-l` and `--k-w`. Touch points default
+to vehicle classes, while plane fitting uses every KITTI class with a valid 3D
+bottom centre (`DontCare` is ignored). The largest bottom-centre group within
+`--max-bottom-y-gap 1.2` metres is used, and poorly distributed X-Z samples are
+rejected by `--min-xz-spread-ratio 0.05`. Labels are written to
+`outputs/geometry_pseudo_labels/val.jsonl`.
+
+The current experimental default is `--plane-point-mode bottom_corners`, which
+fits the four GT bottom corners and therefore permits a single object to define
+a plane. Use `--plane-point-mode bottom_centers` to return to the original
+GPro3D-style scene fit from one bottom centre per object.
+
+Start the two-view local debugger:
+
+    python dashboard/server.py --split val
+
+Then open `http://127.0.0.1:8765`. The dashboard reads real KITTI-format model
+outputs from the directories in `dashboard/model_registry.json`. It never
+creates placeholder predictions, so MonoDETR overlays remain empty until
+`outputs/monodetr/outputs/data/*.txt` exists.
+
 
 ## Acknowlegment
 This repo benefits from the excellent [Deformable-DETR](https://github.com/fundamentalvision/Deformable-DETR) and [MonoDLE](https://github.com/xinzhuma/monodle).

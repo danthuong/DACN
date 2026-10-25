@@ -5,22 +5,43 @@ from torch.optim.optimizer import Optimizer
 
 
 def build_optimizer(cfg_optimizer, model):
-    weights, biases = [], []
+    configured_groups = cfg_optimizer.get('param_groups') or {}
+    base_lr = configured_groups.get('original_monodetr_lr', cfg_optimizer['lr'])
+    head_lr = configured_groups.get('horizon_touchpoint_lr', base_lr)
+    fusion_lr = configured_groups.get('geometry_fusion_lr', head_lr)
+    buckets = {
+        ('base', False): [], ('base', True): [],
+        ('head', False): [], ('head', True): [],
+        ('fusion', False): [], ('fusion', True): [],
+    }
     for name, param in model.named_parameters():
-        if 'bias' in name:
-            biases += [param]
+        if not param.requires_grad:
+            continue
+        if 'geometry_e1.horizon_head' in name or 'geometry_e1.touchpoint_head' in name:
+            family = 'head'
+        elif 'geometry_e1' in name:
+            family = 'fusion'
         else:
-            weights += [param]
+            family = 'base'
+        buckets[(family, name.endswith('.bias'))].append(param)
 
-    parameters = [{'params': biases, 'weight_decay': 0},
-                  {'params': weights, 'weight_decay': cfg_optimizer['weight_decay']}]
+    learning_rates = {'base': base_lr, 'head': head_lr, 'fusion': fusion_lr}
+    parameters = []
+    for (family, is_bias), params in buckets.items():
+        if params:
+            parameters.append({
+                'params': params,
+                'lr': learning_rates[family],
+                'weight_decay': 0 if is_bias else cfg_optimizer['weight_decay'],
+                'group_name': '{}_{}'.format(family, 'bias' if is_bias else 'weight'),
+            })
 
     if cfg_optimizer['type'] == 'sgd':
-        optimizer = optim.SGD(parameters, lr=cfg_optimizer['lr'], momentum=0.9)
+        optimizer = optim.SGD(parameters, lr=base_lr, momentum=0.9)
     elif cfg_optimizer['type'] == 'adam':
-        optimizer = optim.Adam(parameters, lr=cfg_optimizer['lr'])
+        optimizer = optim.Adam(parameters, lr=base_lr)
     elif cfg_optimizer['type'] == 'adamw':
-        optimizer = AdamW(parameters, lr=cfg_optimizer['lr'])
+        optimizer = AdamW(parameters, lr=base_lr)
     else:
         raise NotImplementedError("%s optimizer is not supported" % cfg_optimizer['type'])
 

@@ -51,6 +51,9 @@ class HungarianMatcher(nn.Module):
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
         bs, num_queries = outputs["pred_boxes"].shape[:2]
+        if sum(len(target["labels"]) for target in targets) == 0:
+            empty = torch.empty(0, dtype=torch.int64)
+            return [(empty, empty) for _ in range(bs)]
 
         # We flatten to compute the cost matrices in a batch
         

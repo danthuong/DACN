@@ -29,7 +29,6 @@ class DDNLoss(nn.Module):
             downsample_factor [int]: Depth map downsample factor
         """
         super().__init__()
-        self.device = torch.cuda.current_device()
         self.balancer = Balancer(
             downsample_factor=downsample_factor,
             fg_weight=fg_weight,

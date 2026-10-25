@@ -1,0 +1,23 @@
+extends: e1_common.yaml
+
+geometry_e1:
+  fusion_mode: distribution_level
+  fusion:
+    mode_settings:
+      fused_input_type: object_depth_probability_prior
+      gaussian_sigma_m: 2.5
+      log_prior_clamp: [-12.0, 0.0]
+      preserve_background_logit: true
+      rebuild_weighted_depth_from_fused_logits: true
+      rebuild_positional_embeddings: true
+
+trainer:
+  save_path: outputs/e1_distribution_level/
+
+validation:
+  output_dir: outputs/e1_distribution_level/validation/
+
+logging:
+  wandb:
+    run_name: e1_distribution_level_seed444
+    tags: [monodetr, gpro3d, e1, two_phase, distribution_level]

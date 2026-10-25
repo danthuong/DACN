@@ -1,0 +1,22 @@
+extends: e1_common.yaml
+
+geometry_e1:
+  fusion_mode: feature_level
+  fusion:
+    mode_settings:
+      fused_input_type: latent_depth_feature
+      geometry_channels: [object_depth_map, valid_coverage, confidence]
+      rebuild_depth_encoder_from_fused_features: true
+      rebuild_weighted_depth_from_fused_logits: true
+
+trainer:
+  save_path: outputs/e1_feature_level/
+
+validation:
+  output_dir: outputs/e1_feature_level/validation/
+
+logging:
+  wandb:
+    run_name: e1_feature_level_seed444
+    tags: [monodetr, gpro3d, e1, two_phase, feature_level]
+

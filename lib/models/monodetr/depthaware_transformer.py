@@ -196,11 +196,8 @@ class DepthAwareTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, depth_pos_embed=None, depth_pos_embed_ip=None, attn_mask=None):
-        if not self.two_stage_dino:
-            assert self.two_stage or query_embed is not None
-
-        # prepare input for encoder
+    def encode_visual(self, srcs, masks, pos_embeds):
+        """Run the visual encoder once and return a cache reusable by decoders."""
         src_flatten = []
         mask_flatten = []
         lvl_pos_embed_flatten = []
@@ -225,23 +222,38 @@ class DepthAwareTransformer(nn.Module):
         level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
-        # encoder
         memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
-        #enc_intermediate_output, enc_intermediate_refpoints = None
-        # prepare input for decoder
+        return {
+            'memory': memory,
+            'spatial_shapes': spatial_shapes,
+            'level_start_index': level_start_index,
+            'valid_ratios': valid_ratios,
+            'mask_flatten': mask_flatten,
+            'masks': masks,
+            'pos_embeds': pos_embeds,
+        }
+
+    def decode_from_memory(self, cache, query_embed=None, depth_pos_embed=None,
+                           depth_pos_embed_ip=None, attn_mask=None):
+        """Decode queries from cached visual memory with selected depth memory."""
+        if not self.two_stage_dino:
+            assert self.two_stage or query_embed is not None
+
+        memory = cache['memory']
+        spatial_shapes = cache['spatial_shapes']
+        level_start_index = cache['level_start_index']
+        valid_ratios = cache['valid_ratios']
+        mask_flatten = cache['mask_flatten']
+        masks = cache['masks']
+        pos_embeds = cache['pos_embeds']
         bs, _, c = memory.shape
-        ####DINO_pos
+        enc_outputs_class, enc_outputs_coord_unact = None, None
         if self.two_stage:
-            ###share
             output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
-            # hack implementation for two-stage Deformable DETR
             enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
             enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
-            # enc_outputs_class = self.decoder.class_embed(output_memory)
-            # enc_outputs_coord_unact = self.decoder.bbox_embed(output_memory) + output_proposals
             topk = self.two_stage_num_proposals
-            ####share_end
             topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
             topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 6))
             topk_coords_unact = topk_coords_unact.detach()
@@ -290,8 +302,6 @@ class DepthAwareTransformer(nn.Module):
         depth_pos_embed_ip = depth_pos_embed_ip.flatten(2).permute(2, 0, 1)
         mask_depth = masks[1].flatten(1)
 
-        # decoder
-        #ipdb.set_trace()
         hs, inter_references, inter_references_dim = self.decoder(
             tgt,                 #.transpose(1,0), for DINO
             reference_points,
@@ -304,12 +314,18 @@ class DepthAwareTransformer(nn.Module):
             depth_pos_embed,
             mask_depth, bs=bs, depth_pos_embed_ip=depth_pos_embed_ip, pos_embeds=pos_embeds,attn_mask=attn_mask)
 
-        inter_references_out = inter_references
-        inter_references_out_dim = inter_references_dim
+        return (hs, init_reference_out, inter_references, inter_references_dim,
+                enc_outputs_class, enc_outputs_coord_unact)
 
-        if self.two_stage:
-            return hs, init_reference_out, inter_references_out, inter_references_out_dim, enc_outputs_class, enc_outputs_coord_unact
-        return hs, init_reference_out, inter_references_out, inter_references_out_dim, None, None
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, depth_pos_embed=None,
+                depth_pos_embed_ip=None, attn_mask=None, visual_cache=None,
+                return_visual_cache=False):
+        cache = visual_cache if visual_cache is not None else self.encode_visual(srcs, masks, pos_embeds)
+        outputs = self.decode_from_memory(
+            cache, query_embed, depth_pos_embed, depth_pos_embed_ip, attn_mask)
+        if return_visual_cache:
+            return outputs, cache
+        return outputs
 
 
 class VisualEncoderLayer(nn.Module):
@@ -656,5 +672,6 @@ def build_depthaware_transformer(cfg):
         enc_n_points=cfg['enc_n_points'],
         two_stage=cfg['two_stage'],
         two_stage_num_proposals=cfg['num_queries'],
+        group_num=cfg.get('group_num', 11),
         use_dab= cfg['use_dab'],
         two_stage_dino = cfg['two_stage_dino'])

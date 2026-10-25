@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import torch.utils.data as data
 from PIL import Image, ImageFile
@@ -12,9 +13,6 @@ from lib.datasets.kitti.kitti_utils import get_objects_from_label
 from lib.datasets.kitti.kitti_utils import Calibration
 from lib.datasets.kitti.kitti_utils import get_affine_transform
 from lib.datasets.kitti.kitti_utils import affine_transform
-from lib.datasets.kitti.kitti_eval_python.eval import get_official_eval_result
-from lib.datasets.kitti.kitti_eval_python.eval import get_distance_eval_result
-import lib.datasets.kitti.kitti_eval_python.kitti_common as kitti
 import copy
 from .pd import PhotometricDistort
 
@@ -83,6 +81,41 @@ class KITTI_Dataset(data.Dataset):
         self.pd = PhotometricDistort()
         self.clip_2d = cfg.get('clip_2d', False)
 
+        # E1 geometry pseudo labels are indexed by image id and original KITTI
+        # label-file row. They stay optional for evaluation/inference, but are
+        # required for an E1 training split.
+        self.geometry_cfg = cfg.get('geometry_e1') or {}
+        self.geometry_enabled = bool(self.geometry_cfg.get('enabled', False))
+        self.pseudo_records = {}
+        if self.geometry_enabled:
+            pseudo_cfg = self.geometry_cfg.get('pseudo_labels', {})
+            pseudo_root = pseudo_cfg.get('root')
+            if pseudo_root:
+                pseudo_path = pseudo_root
+                if os.path.isdir(pseudo_path):
+                    pseudo_path = os.path.join(pseudo_path, self.split + '.jsonl')
+                if os.path.isfile(pseudo_path):
+                    self.pseudo_records = self._load_pseudo_records(pseudo_path)
+                elif self.data_augmentation:
+                    raise FileNotFoundError(
+                        'E1 training requires pseudo labels for split {}: {}'.format(
+                            self.split, pseudo_path))
+
+    @staticmethod
+    def _load_pseudo_records(path):
+        records = {}
+        with open(path, 'r') as source:
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    records[str(record['frame_id']).zfill(6)] = record
+                except (ValueError, KeyError) as error:
+                    raise ValueError('Invalid pseudo-label record {}:{}: {}'.format(
+                        path, line_number, error))
+        return records
+
     def get_image(self, idx):
         img_file = os.path.join(self.image_dir, '%06d.png' % idx)
         assert os.path.exists(img_file)
@@ -98,21 +131,32 @@ class KITTI_Dataset(data.Dataset):
         assert os.path.exists(calib_file)
         return Calibration(calib_file)
 
-    def eval(self, results_dir, logger):
+    def eval(self, results_dir, logger, return_dict=False):
+        # Importing the KITTI CUDA/Numba evaluator at module import time makes
+        # CPU dataset tests fail. Keep it lazy; real evaluation still uses the
+        # exact same official implementation.
+        from lib.datasets.kitti.kitti_eval_python.eval import get_official_eval_result
+        import lib.datasets.kitti.kitti_eval_python.kitti_common as kitti
+
         logger.info("==> Loading detections and GTs...")
         img_ids = [int(id) for id in self.idx_list]
-        dt_annos = kitti.get_label_annos(results_dir)
+        dt_annos = kitti.get_label_annos(results_dir, img_ids)
         gt_annos = kitti.get_label_annos(self.label_dir, img_ids)
 
         test_id = {'Car': 0, 'Pedestrian':1, 'Cyclist': 2}
 
         logger.info('==> Evaluating (official) ...')
         car_moderate = 0
+        all_results = {}
         for category in self.writelist:
-            results_str, results_dict, mAP3d_R40 = get_official_eval_result(gt_annos, dt_annos, test_id[category])
+            results_str, results_dict = get_official_eval_result(
+                gt_annos, dt_annos, test_id[category])
             if category == 'Car':
-                car_moderate = mAP3d_R40
+                car_moderate = float(results_dict.get('Car_3d_moderate_R40', 0.0))
+            all_results.update({key: float(value) for key, value in results_dict.items()})
             logger.info(results_str)
+        if return_dict:
+            return car_moderate, all_results
         return car_moderate
 
     def __len__(self):
@@ -168,11 +212,16 @@ class KITTI_Dataset(data.Dataset):
 
         if self.split == 'test':
             calib = self.get_calib(index)
+            affine_h = np.eye(3, dtype=np.float32)
+            affine_h[:2] = trans.astype(np.float32)
+            info['input_calib'] = (affine_h @ calib.P2).astype(np.float32)
+            info['affine'] = affine_h
             return img, calib.P2, img, info
 
         #  ============================   get labels   ==============================
         objects = self.get_label(index)
         calib = self.get_calib(index)
+        original_p2 = calib.P2.copy()
 
         # data augmentation for labels
         if random_flip_flag:
@@ -190,6 +239,16 @@ class KITTI_Dataset(data.Dataset):
                 if object.ry > np.pi:  object.ry -= 2 * np.pi
                 if object.ry < -np.pi: object.ry += 2 * np.pi
 
+        affine_h = np.eye(3, dtype=np.float32)
+        affine_h[:2] = trans.astype(np.float32)
+        if random_flip_flag and not self.aug_calib:
+            flip_h = np.array(
+                [[-1.0, 0.0, float(img_size[0])], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                dtype=np.float32)
+            input_calib = affine_h @ flip_h @ original_p2
+        else:
+            input_calib = affine_h @ calib.P2
+
         # labels encoding
         calibs = np.zeros((self.max_objs, 3, 4), dtype=np.float32)
         indices = np.zeros((self.max_objs), dtype=np.int64)
@@ -203,6 +262,31 @@ class KITTI_Dataset(data.Dataset):
         src_size_3d = np.zeros((self.max_objs, 3), dtype=np.float32)
         boxes = np.zeros((self.max_objs, 4), dtype=np.float32)
         boxes_3d = np.zeros((self.max_objs, 6), dtype=np.float32)
+        object_ids = np.full((self.max_objs,), -1, dtype=np.int64)
+        touch_points = np.zeros((self.max_objs, 4, 2), dtype=np.float32)
+        touchpoint_valid = np.zeros((self.max_objs, 4), dtype=bool)
+
+        pseudo_record = self.pseudo_records.get('{:06d}'.format(index))
+        pseudo_objects = {
+            int(obj['object_id']): obj for obj in (pseudo_record or {}).get('objects', [])
+        }
+        horizon_line = np.zeros((2,), dtype=np.float32)
+        horizon_valid = False
+        pseudo_horizon = (pseudo_record or {}).get('horizon_line') or {}
+        if pseudo_horizon.get('valid'):
+            slope = float(pseudo_horizon['slope'])
+            intercept = float(pseudo_horizon['intercept'])
+            raw_points = np.array(
+                [[0.0, intercept], [float(img_size[0] - 1), slope * float(img_size[0] - 1) + intercept]],
+                dtype=np.float32)
+            if random_flip_flag:
+                raw_points[:, 0] = float(img_size[0]) - raw_points[:, 0]
+            transformed = np.stack([affine_transform(point, trans) for point in raw_points])
+            delta_x = transformed[1, 0] - transformed[0, 0]
+            if np.isfinite(transformed).all() and abs(delta_x) > 1e-6:
+                horizon_line[0] = (transformed[1, 1] - transformed[0, 1]) / delta_x
+                horizon_line[1] = transformed[0, 1] - horizon_line[0] * transformed[0, 0]
+                horizon_valid = True
 
         object_num = len(objects) if len(objects) < self.max_objs else self.max_objs
 
@@ -253,6 +337,24 @@ class KITTI_Dataset(data.Dataset):
             # class
             cls_id = self.cls2id[objects[i].cls_type]
             labels[i] = cls_id
+            object_ids[i] = i
+
+            pseudo_object = pseudo_objects.get(i)
+            if pseudo_object is not None:
+                point_by_name = {
+                    point.get('name'): point for point in pseudo_object.get('touch_points', [])
+                }
+                for point_index, point_name in enumerate(('LF', 'RF', 'RR', 'LR')):
+                    point = point_by_name.get(point_name)
+                    if not point or not point.get('projection_valid') or point.get('pixel_2d') is None:
+                        continue
+                    pixel = np.asarray(point['pixel_2d'], dtype=np.float32)
+                    if random_flip_flag:
+                        pixel[0] = float(img_size[0]) - pixel[0]
+                    pixel = affine_transform(pixel, trans)
+                    if np.isfinite(pixel).all():
+                        touch_points[i, point_index] = pixel / self.resolution
+                        touchpoint_valid[i, point_index] = True
 
             # encoding 2d/3d boxes
             w, h = bbox_2d[2] - bbox_2d[0], bbox_2d[3] - bbox_2d[1]
@@ -324,9 +426,20 @@ class KITTI_Dataset(data.Dataset):
                    'heading_res': heading_res,
                    'mask_2d': mask_2d}
 
+        targets.update({
+                   'object_ids': object_ids,
+                   'touch_points': touch_points,
+                   'touchpoint_valid': touchpoint_valid,
+                   'horizon_line': horizon_line,
+                   'horizon_valid': np.asarray(horizon_valid, dtype=bool),
+                   'input_calib': input_calib.astype(np.float32),
+                   'affine': affine_h.astype(np.float32)})
+
         info = {'img_id': index,
                 'img_size': img_size,
-                'bbox_downsample_ratio': img_size / features_size}
+                'bbox_downsample_ratio': img_size / features_size,
+                'input_calib': input_calib.astype(np.float32),
+                'affine': affine_h.astype(np.float32)}
         return inputs, calib.P2, targets, info
 
 

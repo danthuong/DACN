@@ -1,0 +1,290 @@
+# E1 / MonoDETR × GPro3D: LID foreground depth-logit probabilistic fusion
+# SPECIFICATION for Codex to integrate with the ACTUAL local MonoDETR training code.
+# New sections (geometry_e1, logging, evaluation, runtime) require wiring and schema checks.
+# ${NAME} values are resolved from .env; stock MonoDETR config does not expand env automatically.
+random_seed: 444
+
+dataset:
+  type: &dataset_type KITTI
+  root_dir: "${KITTI_ROOT}"
+  train_split: train
+  test_split: val
+  batch_size: 2  # per GPU, effective batch = 2 x grad_accum_steps(4)
+  use_3d_center: true
+  class_merging: false
+  use_dontcare: false
+  bbox2d_type: anno
+  meanshape: false
+  writelist: [Car]
+  clip_2d: false
+  # Geometry-consistency FIRST. Do not enable crop/flip before K, horizon,
+  # touchpoints, depth target and camera-height transforms pass geometric tests.
+  aug_pd: true
+  aug_crop: false
+  aug_calib: false
+  random_flip: 0.0
+  random_crop: 0.0
+  scale: 0.05
+  shift: 0.05
+  depth_scale: normal  # no crops => scale=1; explicitly verify on local loader
+
+model_name: monodetr
+model:
+  num_classes: 3
+  return_intermediate_dec: true
+  device: cuda
+  backbone: resnet50
+  train_backbone: true
+  num_feature_levels: 4
+  dilation: false
+  position_embedding: sine
+  masks: false
+  mode: LID
+  num_depth_bins: 80
+  depth_min: 0.001
+  depth_max: 60.0
+  with_box_refine: true
+  two_stage: false
+  use_dab: false
+  use_dn: false
+  two_stage_dino: false
+  init_box: false
+  enc_layers: 3
+  dec_layers: 3
+  hidden_dim: 256
+  dim_feedforward: 256
+  dropout: 0.1
+  nheads: 8
+  num_queries: 50
+  group_num: 11  # inspect LOCAL baseline grouping + checkpoint before enabling
+  enc_n_points: 4
+  dec_n_points: 4
+  aux_loss: true
+  # Preserve the original MonoDETR criterion and ALL loss heads.
+  cls_loss_coef: 2.0
+  focal_alpha: 0.25
+  bbox_loss_coef: 5.0
+  giou_loss_coef: 2.0
+  3dcenter_loss_coef: 10.0
+  dim_loss_coef: 1.0
+  angle_loss_coef: 1.0
+  depth_loss_coef: 1.0
+  depth_map_loss_coef: 1.0
+  set_cost_class: 2.0
+  set_cost_bbox: 5.0
+  set_cost_giou: 2.0
+  set_cost_3dcenter: 10.0
+
+geometry_e1:
+  enabled: true
+  fusion_mode: distribution_level
+  pretrained_checkpoint: "${MONODETR_CHECKPOINT}"
+  checkpoint_loading: matching_keys_and_shapes_only_report_every_mismatch
+  two_pass_decoder: true
+  share_decoder_weights: true
+  cache_backbone_visual_encoder: true
+  pass1_depth_cross_attention: original_on
+  pass2_depth_cross_attention: fused_on
+
+  pseudo_labels:
+    root: "${PSEUDOLABEL_ROOT}"
+    alignment: image_id_and_gt_object_id
+    # Agent inspects current real format; do not invent extension/schema.
+    horizon_keys: [k, b]
+    max_touchpoints: 4
+    require_consistent_semantic_slots: true
+    invalidate_missing_labels: true
+    no_gt_inputs_at_inference: true
+
+  horizon:
+    source: backbone_multiscale_stride_8_16_32
+    fpn_channels: 128
+    heatmap_stride: 4
+    head_output_channels: 1
+    gaussian_sigma_heatmap_px: 1.5
+    decoder: differentiable_softargmax_weighted_least_squares
+    softargmax_temperature: 0.25
+    pixel_center_convention: align_corners_false
+    entropy_confidence: true
+    vertical_edge_refinement_training: false
+    vertical_edge_refinement_inference: false
+    use_fp32_for_line_fitting: true
+
+  touchpoint:
+    source: decoder_pass1_final_q3
+    mlp_dims: [256, 256, 128, 8]
+    max_touchpoints: 4
+    label_valid_mask: true
+    prediction_frame: network_image_pixels
+    predict_box_relative: true
+    offset_decoder: scaled_sigmoid
+    offset_range: [-0.25, 1.25]
+    bbox_decoder: repo_native_cxcylrtb_to_xyxy
+    supervise_matched_only: true
+    class_filter: [Car]
+    loss: smooth_l1
+    box_detach: false
+    teacher_q3_kd: false
+
+  plane:
+    input: horizon_line_plus_K_plus_camera_height
+    camera_height_m: 1.65  # research assumption; override via CAMERA_HEIGHT_M
+    camera_height_env: CAMERA_HEIGHT_M
+    height_definition: normal_distance
+    kittti_axes: X_right_Y_down_Z_forward
+    require_calibration_alignment: true
+    check_projection_translation: true
+    raycast_fp32: true
+    min_abs_ray_plane_dot: 0.015
+    valid_min_depth_m: 2.0
+    valid_max_depth_m: 65.0
+    aggregation: gpro3d_verified_or_masked_robust_center_depth
+    invalid_geometry_policy: identity_fusion
+
+  spatial_projection:
+    grid_source: depth_predictor_feature
+    query_group: first_canonical_group_in_training
+    object_weight: class_confidence_times_geometry_validity
+    rectangle_mask: differentiable_sigmoid_edges
+    box_edge_softness_grid_px: 1.25
+    overlap_strategy: normalized_soft_object_weights
+    avoid_hard_topk: true
+    identity_for_no_coverage: true
+
+  fusion:
+    initial_alpha: 0.01  # gate starts almost zero, then is trainable
+    gate_type: learnable_scalar
+    alpha_min: 0.0
+    alpha_max: 1.0
+    require_alpha_zero_identity_test: true
+    preserve_background_logit: true
+    mode_settings:
+      fused_input_type: lidar_style_object_depth_probability_prior
+      depth_bins_use_exact_original_lid: true
+      num_foreground_bins: 80
+      num_background_bins: 1
+      prior_type: gaussian_on_original_depth_bin_centers
+      gaussian_sigma_m: 2.5
+      sigma_learnable: false
+      fusion_operation: gated_product_of_experts_logits
+      log_prior_clamp: [-12.0, 0.0]
+      normalize_log_prior_relative_to_spatial_mean: true
+      preserve_background_logit: true
+      rebuild_weighted_depth_from_fused_logits: true
+      rebuild_positional_embeddings: true
+      original_depth_encoder_feature: reused_unmodified
+      decoder_depth_memory_uses_fused_positional_embeddings: true
+
+  losses:
+    retain_original_detector_criterion: true
+    retain_original_query_depth_loss: true
+    retain_original_foreground_depth_map_loss: true
+    touchpoint_loss_coef: 1.0
+    horizon_heatmap_loss_coef: 1.0
+    horizon_line_loss_coef: 0.5
+    fused_depth_map_loss_coef: 1.0
+    pass1_aux_detection_loss_coef_phase2: 0.10
+    geometric_center_depth_loss_coef: 0.0  # ablation later
+    prevent_double_count_original_depth_map: true
+
+  training:
+    pretrained_finetune: true
+    phase1_fusion_off: true
+    phase1_decoder_passes: 1
+    phase2_decoder_passes: 2
+    fusion_start_epoch: 8  # epoch indexed from zero
+    train_horizon_and_touchpoint_both_phases: true
+    train_detection_both_phases: true
+    phase2_fully_differentiable: true
+    freeze_pass1: false
+    detach_geometry: false
+    use_previous_epoch_cache: false
+    use_teacher_model: false
+    best_checkpoint_metric: val/ap3d_r40_car_moderate
+
+optimizer:
+  type: adamw
+  lr: 0.00001  # pretrained parameters
+  weight_decay: 0.0001
+  param_groups:
+    original_monodetr_lr: 0.00001
+    horizon_touchpoint_lr: 0.0001
+    geometry_fusion_lr: 0.0001
+  grad_clip_norm: 0.1
+
+lr_scheduler:
+  type: cos
+  warmup: false
+  decay_rate: 0.1
+  decay_list: []
+
+trainer:
+  max_epoch: 30
+  gpu_ids: '0'
+  save_frequency: 1
+  pretrain_model: "${MONODETR_CHECKPOINT}"
+  save_path: "outputs/e1_distribution_level/"
+  save_all: false
+  use_dn: false
+  grad_accum_steps: 4
+  save_last_and_best: true
+  resume_strict_phase_and_optimizer: true
+
+runtime:
+  accelerator: cuda
+  num_gpus: 1
+  precision: bf16_if_supported_else_fp16
+  gradient_accumulation_steps: 4
+  geometry_force_fp32: true
+  device_memory_target: RTX4090_24GB
+  allow_gradient_checkpointing_on_oom: true
+  num_workers: 4
+  deterministic_validation: true
+  benchmark_timing_warmup_iters: 20
+
+validation:
+  split: val
+  every_n_epochs: 1
+  compare_models: [baseline_pretrained, ours_pass1, ours_pass2]
+  baseline_checkpoint: "${MONODETR_CHECKPOINT}"
+  metric_depth_definition: camera_z_of_kitti_object_center
+  matching_for_depth_analysis: class_constrained_one_to_one_2d_iou
+  iou_threshold: 0.5
+  report_tp_only_and_paired_intersection: true
+  distance_bins_m: [0, 10, 20, 30, 40, 60]
+  metrics: [mae, rmse, median_ae, p90_ae, abs_rel, signed_bias, matched_count, recall]
+  official_kitti_ap3d_r40: true
+  output_dir: "outputs/e1_distribution_level/validation/"
+  export_per_object: true
+  export_per_image: true
+  export_formats: [json, csv]
+
+logging:
+  log_every_n_steps: 20
+  tensor_shapes_on_first_step: true
+  gradient_norms_every_n_steps: 100
+  wandb:
+    enabled: true
+    project: "${WANDB_PROJECT}"
+    entity: "${WANDB_ENTITY}"
+    mode: "${WANDB_MODE}"  # online/offline/disabled; fallback offline
+    run_name: e1_distribution_level_seed444
+    tags: [monodetr, gpro3d, e1, two_phase, distribution_level]
+    log_validation_images: true
+    val_visualization_samples: 8
+    log_checkpoint_metadata: true
+  dashboard:
+    integrate_existing_two_panel_dashboard: true
+    api_url: "${DASHBOARD_API_URL}"
+    optional_api_token_env: DASHBOARD_AUTH_TOKEN
+    register_model_id: e1_distribution_level
+    register_run_output_dir: "outputs/e1_distribution_level/"
+    panels: [image_3d_overlay, bev_distance_rings]
+
+# Preserve original MonoDETR tester schema too, do not replace official KITTI evaluator.
+tester:
+  type: *dataset_type
+  mode: single
+  checkpoint: 30
+  threshold: 0.2
+  topk: 50

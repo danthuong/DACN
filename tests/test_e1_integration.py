@@ -1,0 +1,85 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+from torch import nn
+
+from lib.helpers.config_helper import load_config
+from lib.helpers.optimizer_helper import build_optimizer
+from lib.models.monodetr.matcher import HungarianMatcher
+from lib.models.monodetr.monodetr import SetCriterion
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class NamedToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Linear(2, 2)
+        self.geometry_e1 = nn.Module()
+        self.geometry_e1.horizon_head = nn.Linear(2, 2)
+        self.geometry_e1.touchpoint_head = nn.Linear(2, 2)
+        self.geometry_e1.feature_adapter = nn.Linear(2, 2)
+        self.geometry_e1.fusion_alpha = nn.Parameter(torch.tensor(0.01))
+
+
+class E1IntegrationTest(unittest.TestCase):
+    def test_config_extends_and_environment_defaults(self):
+        config = load_config(ROOT / 'configs' / 'e1_feature_level.yaml', ROOT / 'missing.env')
+        self.assertEqual(config['model']['num_queries'], 50)
+        self.assertEqual(config['model']['group_num'], 11)
+        self.assertEqual(config['geometry_e1']['fusion_mode'], 'feature_level')
+        self.assertEqual(config['dataset']['depth_scale'], 'none')
+        self.assertIsInstance(config['geometry_e1']['plane']['camera_height_m'], float)
+
+    def test_optimizer_groups_every_parameter_once(self):
+        model = NamedToyModel()
+        optimizer = build_optimizer({
+            'type': 'adamw', 'lr': 1e-5, 'weight_decay': 1e-4,
+            'param_groups': {
+                'original_monodetr_lr': 1e-5,
+                'horizon_touchpoint_lr': 1e-4,
+                'geometry_fusion_lr': 2e-4,
+            },
+        }, model)
+        parameters = [parameter for group in optimizer.param_groups for parameter in group['params']]
+        self.assertEqual(len(parameters), len({id(parameter) for parameter in parameters}))
+        self.assertEqual(len(parameters), len(list(model.parameters())))
+        rates = {group['group_name']: group['lr'] for group in optimizer.param_groups}
+        self.assertEqual(rates['base_weight'], 1e-5)
+        self.assertEqual(rates['head_weight'], 1e-4)
+        self.assertEqual(rates['fusion_weight'], 2e-4)
+
+    def test_empty_ground_truth_object_losses_are_finite(self):
+        matcher = HungarianMatcher(1, 1, 1, 1)
+        criterion = SetCriterion(
+            3, matcher, {}, 0.25, [], group_num=1, geometry_cfg={})
+        outputs = {
+            'pred_logits': torch.randn(2, 5, 3, requires_grad=True),
+            'pred_boxes': torch.rand(2, 5, 6, requires_grad=True),
+            'pred_depth': torch.rand(2, 5, 2, requires_grad=True),
+            'pred_3d_dim': torch.rand(2, 5, 3, requires_grad=True),
+            'pred_angle': torch.rand(2, 5, 24, requires_grad=True),
+        }
+        targets = [{
+            'labels': torch.empty(0, dtype=torch.long),
+            'boxes': torch.empty(0, 4),
+            'boxes_3d': torch.empty(0, 6),
+            'depth': torch.empty(0, 1),
+            'size_3d': torch.empty(0, 3),
+            'heading_bin': torch.empty(0, 1, dtype=torch.long),
+            'heading_res': torch.empty(0, 1),
+        } for _ in range(2)]
+        indices = matcher(outputs, targets, group_num=1)
+        losses = {}
+        for name in ('center', 'boxes', 'depths', 'dims', 'angles'):
+            losses.update(criterion.get_loss(name, outputs, targets, indices, 1.0))
+        total = sum(losses.values())
+        self.assertTrue(torch.isfinite(total))
+        total.backward()
+
+
+if __name__ == '__main__':
+    unittest.main()

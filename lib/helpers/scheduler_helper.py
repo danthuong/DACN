@@ -11,7 +11,11 @@ def build_lr_scheduler(cfg, optimizer, last_epoch):
                 cur_decay = cur_decay * cfg['decay_rate']
         return cur_decay
 
-    lr_scheduler = lr_sched.LambdaLR(optimizer, lr_lbmd, last_epoch=last_epoch)
+    if cfg.get('type', 'step') == 'cos':
+        lr_scheduler = lr_sched.CosineAnnealingLR(
+            optimizer, T_max=int(cfg.get('max_epoch', 30)), last_epoch=last_epoch)
+    else:
+        lr_scheduler = lr_sched.LambdaLR(optimizer, lr_lbmd, last_epoch=last_epoch)
     warmup_lr_scheduler = None
     if cfg['warmup']:
         warmup_lr_scheduler = CosineWarmupLR(optimizer, num_epoch=5, init_lr=0.00001)
