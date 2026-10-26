@@ -51,6 +51,40 @@ def save_checkpoint(state, filename):
     torch.save(state, filename)
 
 
+def _as_cpu_byte_rng_state(state):
+    """Normalize RNG tensors after loading a checkpoint onto any device.
+
+    ``torch.load(..., map_location='cuda')`` also moves the saved CPU RNG
+    tensor to CUDA.  PyTorch's CPU and CUDA RNG setters both expect their
+    serialized state as a CPU ByteTensor, so move/cast it back explicitly.
+    """
+    if torch.is_tensor(state):
+        return state.detach().to(device='cpu', dtype=torch.uint8).contiguous()
+    return torch.as_tensor(state, dtype=torch.uint8, device='cpu').contiguous()
+
+
+def _restore_random_state(random_state):
+    if random_state.get('python') is not None:
+        random.setstate(random_state['python'])
+    if random_state.get('numpy') is not None:
+        np.random.set_state(random_state['numpy'])
+
+    torch_cpu_state = random_state.get('torch_cpu')
+    if torch_cpu_state is not None:
+        torch.set_rng_state(_as_cpu_byte_rng_state(torch_cpu_state))
+
+    torch_cuda_states = random_state.get('torch_cuda')
+    if torch.cuda.is_available() and torch_cuda_states is not None:
+        normalized_states = [
+            _as_cpu_byte_rng_state(state) for state in torch_cuda_states
+        ]
+        # A checkpoint may have been written with more GPUs than are visible
+        # for the current run. Restore the states for the available devices.
+        normalized_states = normalized_states[:torch.cuda.device_count()]
+        if normalized_states:
+            torch.cuda.set_rng_state_all(normalized_states)
+
+
 def load_checkpoint(model, optimizer, filename, map_location, logger=None,
                     scheduler=None, scaler=None):
     if os.path.isfile(filename):
@@ -69,11 +103,7 @@ def load_checkpoint(model, optimizer, filename, map_location, logger=None,
             scaler.load_state_dict(checkpoint['scaler_state'])
         random_state = checkpoint.get('random_state')
         if random_state:
-            random.setstate(random_state['python'])
-            np.random.set_state(random_state['numpy'])
-            torch.set_rng_state(random_state['torch_cpu'])
-            if torch.cuda.is_available() and random_state.get('torch_cuda') is not None:
-                torch.cuda.set_rng_state_all(random_state['torch_cuda'])
+            _restore_random_state(random_state)
         logger.info("==> Done")
     else:
         raise FileNotFoundError
