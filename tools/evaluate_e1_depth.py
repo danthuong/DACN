@@ -120,8 +120,10 @@ def official_kitti_metrics(gt_dir, prediction_dir, frame_ids, class_name):
     numeric_ids = [int(value) for value in frame_ids]
     gt_annos = kitti.get_label_annos(str(gt_dir), numeric_ids)
     dt_annos = kitti.get_label_annos(str(prediction_dir), numeric_ids)
-    _, values = get_official_eval_result(gt_annos, dt_annos, class_ids[class_name])
-    return {key: float(value) for key, value in values.items()}
+    official_result = get_official_eval_result(
+        gt_annos, dt_annos, class_ids[class_name]
+    )
+    _, values = official_result[:2]
 
 
 def evaluate(args):
