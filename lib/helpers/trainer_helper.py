@@ -326,10 +326,15 @@ class Trainer(object):
                 for key, val in detr_losses_dict_log.items():
                     if key == "loss_detr":
                         continue
-                    if "0" in key or "1" in key or "2" in key or "3" in key or "4" in key or "5" in key:
-                        if flags[int(key[-1])]:
+                    # Only decoder auxiliary losses end in a numeric layer
+                    # suffix. Keys such as ``loss_pass1_ce`` contain a digit
+                    # but do not have one at the end.
+                    suffix = key.rsplit('_', 1)[-1]
+                    if suffix.isdigit() and 0 <= int(suffix) < len(flags):
+                        layer_index = int(suffix)
+                        if flags[layer_index]:
                             print("")
-                            flags[int(key[-1])] = False
+                            flags[layer_index] = False
                     # Geometry losses operate on normalized image coordinates
                     # and are commonly below 0.005; two decimals misleadingly
                     # render healthy non-zero supervision as 0.00.
