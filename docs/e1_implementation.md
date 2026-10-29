@@ -120,6 +120,33 @@ Feature and distribution checkpoints are respectively written below
 `outputs/e1_feature_level/monodetr/` and
 `outputs/e1_distribution_level/monodetr/`.
 
+### Always-two-pass training experiments
+
+The recommended main run initializes all original detector tensors from the
+MonoDETR checkpoint but starts a fresh optimizer/scheduler and executes Pass 1,
+geometry fusion, and Pass 2 from epoch 0:
+
+```bash
+python tools/train_val.py --config configs/e1_feature_joint_epoch0.yaml \
+  --env-file .env
+```
+
+The separate scratch-detector ablation does not load a MonoDETR checkpoint. It
+retains the repository's ImageNet initialization for ResNet-50 and trains the
+random transformer/depth/detection/E1 modules for the original 195-epoch-style
+schedule:
+
+```bash
+python tools/train_val.py --config configs/e1_feature_scratch_imagenet.yaml \
+  --env-file .env
+```
+
+Both use feature-level fusion, Touchpoint v2 supervision, two decoder passes
+from the first batch, a `0.001` trainable fusion gate capped at `0.1`, and no
+vertical-edge eval-only refinement. The pretrained run keeps Pass-1 detection
+at weight `0.5`; scratch keeps it at `1.0`. These are intentionally separate
+output/W&B runs and should not resume from one another.
+
 ## Export and fair evaluation
 
 First export the untouched baseline once on the exact same `val` loader:

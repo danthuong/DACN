@@ -34,6 +34,43 @@ class E1IntegrationTest(unittest.TestCase):
         self.assertEqual(config['dataset']['depth_scale'], 'none')
         self.assertIsInstance(config['geometry_e1']['plane']['camera_height_m'], float)
 
+    def test_touchpoint_v2_config_uses_stronger_relative_supervision(self):
+        config = load_config(
+            ROOT / 'configs' / 'e1_feature_level_touch_v2.yaml',
+            ROOT / 'missing.env')
+        touch = config['geometry_e1']['touchpoint']
+        self.assertEqual(touch['loss_coordinate_mode'], 'box_relative')
+        self.assertAlmostEqual(touch['smooth_l1_beta'], 0.05)
+        self.assertTrue(touch['require_inside_image'])
+        self.assertTrue(touch['box_detach'])
+
+    def test_joint_epoch0_config_uses_pretrained_always_two_pass(self):
+        config = load_config(
+            ROOT / 'configs' / 'e1_feature_joint_epoch0.yaml',
+            ROOT / 'missing.env')
+        geometry = config['geometry_e1']
+        self.assertEqual(geometry['training']['fusion_start_epoch'], 0)
+        self.assertEqual(geometry['training']['phase1_decoder_passes'], 2)
+        self.assertAlmostEqual(geometry['fusion']['initial_alpha'], 0.001)
+        self.assertAlmostEqual(geometry['fusion']['alpha_max'], 0.1)
+        self.assertFalse(
+            geometry['horizon']['vertical_edge_refinement']['enabled'])
+        self.assertTrue(config['trainer']['pretrain_model'])
+        self.assertEqual(config['trainer']['max_epoch'], 30)
+
+    def test_scratch_config_removes_detector_checkpoint_and_uses_long_schedule(self):
+        config = load_config(
+            ROOT / 'configs' / 'e1_feature_scratch_imagenet.yaml',
+            ROOT / 'missing.env')
+        self.assertIsNone(config['trainer']['pretrain_model'])
+        self.assertIsNone(config['geometry_e1']['pretrained_checkpoint'])
+        self.assertEqual(config['trainer']['max_epoch'], 195)
+        self.assertEqual(config['trainer']['grad_accum_steps'], 1)
+        self.assertAlmostEqual(
+            config['optimizer']['param_groups']['original_monodetr_lr'], 2e-4)
+        self.assertEqual(config['lr_scheduler']['decay_list'], [125, 165])
+        self.assertTrue(config['lr_scheduler']['warmup'])
+
     def test_optimizer_groups_every_parameter_once(self):
         model = NamedToyModel()
         optimizer = build_optimizer({

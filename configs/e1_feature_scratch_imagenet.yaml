@@ -1,0 +1,43 @@
+extends: e1_feature_joint_epoch0.yaml
+
+# Scratch ablation: do not load a MonoDETR detector checkpoint. The repository
+# still initializes ResNet-50 from ImageNet in backbone.py; the transformer,
+# depth predictor, detection heads, and all E1 modules start from their normal
+# random initialization.
+geometry_e1:
+  pretrained_checkpoint: null
+  losses:
+    # The random detector needs a full-strength Pass-1 learning signal while
+    # the small fusion gate protects Pass 2 from early noisy geometry.
+    pass1_aux_detection_loss_coef_phase2: 1.0
+
+optimizer:
+  type: adamw
+  lr: 0.0002
+  weight_decay: 0.0001
+  param_groups:
+    original_monodetr_lr: 0.0002
+    horizon_touchpoint_lr: 0.0002
+    geometry_fusion_lr: 0.0001
+  grad_clip_norm: 0.1
+
+lr_scheduler:
+  type: step
+  warmup: true
+  decay_rate: 0.1
+  decay_list: [125, 165]
+
+trainer:
+  pretrain_model: null
+  resume_model: null
+  max_epoch: 195
+  grad_accum_steps: 1
+  save_path: outputs/e1_feature_scratch_imagenet/
+
+validation:
+  output_dir: outputs/e1_feature_scratch_imagenet/validation/
+
+logging:
+  wandb:
+    run_name: e1_feature_scratch_imagenet_seed444
+    tags: [monodetr, gpro3d, e1, feature_level, always_two_pass, scratch_detector, imagenet_backbone]

@@ -1,0 +1,42 @@
+extends: e1_feature_level_touch_v2.yaml
+
+# Main experiment: initialize the detector from the converged MonoDETR
+# checkpoint, reset optimizer/scheduler, and train the complete two-pass graph
+# from epoch 0. Nothing from the baseline detector is frozen.
+geometry_e1:
+  horizon:
+    # Keep train/validation geometry identical for the first stable ablation.
+    # Re-enable this later as a separate inference-only post-process ablation.
+    vertical_edge_refinement:
+      enabled: false
+  fusion:
+    initial_alpha: 0.001
+    alpha_min: 0.0
+    alpha_max: 0.1
+  losses:
+    # Avoid immediately doubling the original DDN supervision when the fused
+    # map is still almost identical to the pretrained depth map.
+    fused_depth_map_loss_coef: 0.25
+    # Pass 1 remains a strong anchor instead of dropping abruptly to 0.10.
+    pass1_aux_detection_loss_coef_phase2: 0.50
+  training:
+    fusion_start_epoch: 0
+    phase1_decoder_passes: 2
+    phase2_decoder_passes: 2
+    detach_geometry: false
+    freeze_pass1: false
+
+trainer:
+  # load_pretrained_checkpoint restores model tensors only. Optimizer,
+  # scheduler, epoch, and RNG state all start as a new run.
+  pretrain_model: "${MONODETR_CHECKPOINT:-outputs/monodetr/checkpoint_best_1.pth}"
+  max_epoch: 30
+  save_path: outputs/e1_feature_joint_epoch0/
+
+validation:
+  output_dir: outputs/e1_feature_joint_epoch0/validation/
+
+logging:
+  wandb:
+    run_name: e1_feature_joint_epoch0_seed444
+    tags: [monodetr, gpro3d, e1, feature_level, always_two_pass, pretrained_init]
