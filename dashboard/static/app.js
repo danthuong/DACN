@@ -138,8 +138,19 @@ function drawCamera() {
   }
   if (state.toggles.horizon) {
     for (const model of selectedModels()) {
-      const segment = state.frame.inference_artifacts?.[model.id]?.horizon?.visible_segment_raw;
+      const horizon = state.frame.inference_artifacts?.[model.id]?.horizon;
+      const segment = horizon?.visible_segment_raw;
       if (!segment) continue;
+      const rawSegment = horizon?.raw_visible_segment_raw;
+      if (rawSegment && horizon?.vertical_edge_refinement?.valid) {
+        const [rawLeft, rawRight] = rawSegment.map(map);
+        ctx.save();
+        ctx.globalAlpha = 0.38;
+        ctx.strokeStyle = model.color; ctx.lineWidth = 1.2 * size.ratio;
+        ctx.setLineDash([1 * size.ratio, 5 * size.ratio]);
+        ctx.beginPath(); ctx.moveTo(...rawLeft); ctx.lineTo(...rawRight); ctx.stroke();
+        ctx.restore();
+      }
       const [left, right] = segment.map(map);
       ctx.save();
       ctx.strokeStyle = model.color; ctx.lineWidth = 1.8 * size.ratio;

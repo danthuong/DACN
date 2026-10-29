@@ -22,6 +22,18 @@ stride-4 one-channel ridge. Vertical soft-argmax followed by confidence-weighted
 least squares yields `v = k*u + b` in 1280×384 network-input pixels. The
 `align_corners=False` pixel-centre mapping is implemented and unit-tested.
 
+During evaluation/inference, the enabled vertical-edge refiner follows GPro3D
+Algorithm 1: denormalize RGB, Gaussian blur, Canny, probabilistic Hough, retain
+70–110 degree segments, and select the strongest coherent angle cluster. If the
+cluster passes the count and angle-standard-deviation checks, its perpendicular
+slope is fixed and the intercept is re-fitted by weighted least squares from
+the learned heatmap ridge. If it is unreliable, the operation is an exact
+fallback to the raw horizon. This OpenCV stage is deliberately bypassed under
+`model.train()` so it does not cut the Phase-2 gradient path. Inference
+artifacts store raw/final lines plus edge count, mean angle, standard deviation
+and validity. The dashboard and validation renderer show the raw line faintly
+when refinement is accepted, with the final geometry line drawn on top.
+
 For transformed projection matrix `P2_input = A @ P2`, `M=P2_input[:,:3]` and
 image line `l=[-k,1,-b]`, the ground normal is `normalize(M.T @ l)`, signed toward
 positive camera Y. The plane is `n.X - H = 0`, where `H` is the configurable
@@ -142,6 +154,37 @@ missed GT, paired-intersection delta, distance buckets, KITTI difficulties,
 official AP3D/BEV R40, latency metadata, CSV rows and a Markdown table. Validation
 GT is metric-only and never enters model inference. No missing prediction is
 converted to depth zero.
+
+### Full-val branch depth MAE
+
+Inference artifacts are now emitted for both baseline MonoDETR and E1. Each
+selected query records three distinct depth definitions: final MonoDETR head
+depth, the pure weighted-depth map sampled at its projected centre, and (for
+E1) valid GPro3D ray/plane depth. Export the complete val split first:
+
+```bash
+python tools/train_val.py -e --config configs/monodetr.yaml \
+  --checkpoint-path outputs/monodetr/checkpoint_best_1.pth \
+  --export monodetr_val=final
+```
+
+Then evaluate every frame listed in `val.txt`:
+
+```bash
+python tools/evaluate_val_depth_mae.py \
+  --artifact-dir outputs/monodetr/outputs/monodetr_val/artifacts \
+  --output-dir outputs/monodetr/validation_depth_mae
+```
+
+For E1, point `--artifact-dir` at the exported Pass-2 artifacts. The report
+contains `monodetr_final`, `monodetr_pass1`, `depth_predictor_original`,
+`depth_predictor_selected`, and `gpro3d`. Matching is class-constrained,
+one-to-one 2D IoU ≥ 0.5. MAE uses matched detections only and reports both
+detector recall and per-branch coverage. By default the command fails if even
+one val artifact is missing, preventing an accidental partial-split result.
+It additionally reports all branches on the exact GPro3D-valid object subset;
+use that paired table—not the unequal-coverage headline rows—when comparing
+whether geometric depth is more accurate than Depth Predictor depth.
 
 ## Dashboard
 

@@ -34,6 +34,20 @@ geometry_e1:
     softargmax_temperature: 0.25
     entropy_confidence: true
     use_fp32_for_line_fitting: true
+    vertical_edge_refinement:
+      enabled: true
+      # GPro3D Algorithm 1. This runs only under model.eval(); training keeps
+      # the differentiable raw Horizon Head line in the geometry path.
+      gaussian_kernel_size: 13
+      gaussian_sigma: 4.0
+      canny_thresholds: [50, 100]
+      hough_threshold: 5
+      min_line_length_px: 40
+      max_line_gap_px: 10
+      vertical_angle_range_deg: [70.0, 110.0]
+      cluster_tolerance_deg: 3.0
+      min_edge_count: 5
+      max_angle_std_deg: 3.0
   touchpoint:
     max_touchpoints: 4
     class_index: 1
@@ -132,4 +146,3 @@ logging:
     mode: "${WANDB_MODE:-offline}"
     log_validation_images: true
     val_visualization_samples: 8
-
