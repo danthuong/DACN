@@ -135,16 +135,40 @@ class GeometryE1Test(unittest.TestCase):
         torch.testing.assert_close(fused, logits, rtol=0, atol=0)
         torch.testing.assert_close(fused[:, -1:], logits[:, -1:], rtol=0, atol=0)
 
-    def test_feature_alpha_zero_is_exact_identity(self):
+    def test_feature_alpha_near_zero_is_effective_identity(self):
         module = GeometryE1(geometry_cfg("feature_level"), 16, 50, self.bin_values)
-        module.fusion_alpha.data.zero_()
+        module.fusion_alpha_logit.data.fill_(-30.0)
         source = torch.randn(2, 16, 4, 5)
         geometry = {
             "spatial_prior": torch.rand(2, 1, 4, 5),
             "valid_coverage": torch.rand(2, 1, 4, 5),
             "confidence_map": torch.rand(2, 1, 4, 5),
         }
-        torch.testing.assert_close(module.fuse_feature(source, geometry), source, rtol=0, atol=0)
+        torch.testing.assert_close(
+            module.fuse_feature(source, geometry), source, rtol=0, atol=1e-6)
+
+    def test_sigmoid_alpha_initialization_and_near_zero_gradient(self):
+        cfg = geometry_cfg()
+        cfg["fusion"]["initial_alpha"] = 0.01
+        cfg["fusion"]["alpha_max"] = 0.1
+        module = GeometryE1(cfg, 256, 50, self.bin_values)
+        self.assertAlmostEqual(module.alpha.item(), 0.01, places=6)
+        module.fusion_alpha_logit.data.fill_(-12.0)
+        module.alpha.backward()
+        self.assertGreater(module.alpha.item(), 0.0)
+        self.assertIsNotNone(module.fusion_alpha_logit.grad)
+        self.assertGreater(module.fusion_alpha_logit.grad.abs().item(), 0.0)
+
+    def test_old_direct_alpha_checkpoint_is_migrated_to_logit(self):
+        cfg = geometry_cfg()
+        cfg["fusion"]["initial_alpha"] = 0.01
+        cfg["fusion"]["alpha_max"] = 0.1
+        module = GeometryE1(cfg, 256, 50, self.bin_values)
+        state = module.state_dict()
+        state.pop("fusion_alpha_logit")
+        state["fusion_alpha"] = torch.tensor(0.025)
+        module.load_state_dict(state)
+        self.assertAlmostEqual(module.alpha.item(), 0.025, places=6)
 
     def test_distribution_fusion_backpropagates_to_geometry(self):
         module = GeometryE1(geometry_cfg(), 256, 50, self.bin_values)
@@ -160,7 +184,7 @@ class GeometryE1Test(unittest.TestCase):
         fused[:, :-1].square().mean().backward()
         self.assertIsNotNone(depths.grad)
         self.assertGreater(depths.grad.abs().sum().item(), 0.0)
-        self.assertIsNotNone(module.fusion_alpha.grad)
+        self.assertIsNotNone(module.fusion_alpha_logit.grad)
 
 
 if __name__ == "__main__":

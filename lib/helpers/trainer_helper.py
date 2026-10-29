@@ -121,11 +121,11 @@ class Trainer(object):
                 sums['horizon_touchpoint'] += squared
             else:
                 sums['fusion'] += squared
-            if name.endswith('geometry_e1.fusion_alpha'):
+            if name.endswith('geometry_e1.fusion_alpha_logit'):
                 alpha_gradient = float(parameter.grad.detach().float().abs())
         values = {'grad/' + name: value ** 0.5 for name, value in sums.items()}
         if alpha_gradient is not None:
-            values['grad/fusion_alpha_abs'] = alpha_gradient
+            values['grad/fusion_alpha_logit_abs'] = alpha_gradient
         return values
 
     def _run_depth_validation(self):
@@ -421,4 +421,3 @@ class Trainer(object):
                     target_dict[key] = val[bz]
             targets_list.append(target_dict)
         return targets_list
-

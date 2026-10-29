@@ -5,8 +5,17 @@ extends: e1_distribution_joint_epoch0.yaml
 # transformer, depth predictor, detection heads, and E1 modules start randomly.
 geometry_e1:
   pretrained_checkpoint: null
+  fusion:
+    # The effective gate is sigmoid-parameterized and trained jointly from
+    # scratch. It starts non-trivial but remains free to move in (0, 0.1).
+    initial_alpha: 0.01
+    alpha_min: 0.0
+    alpha_max: 0.1
   losses:
     pass1_aux_detection_loss_coef_phase2: 1.0
+  training:
+    # Pass 1, geometry fusion, and Pass 2 are active from the first batch.
+    fusion_start_epoch: 0
 
 optimizer:
   type: adamw
@@ -16,6 +25,7 @@ optimizer:
     original_monodetr_lr: 0.0002
     horizon_touchpoint_lr: 0.0002
     geometry_fusion_lr: 0.0001
+    fusion_alpha_lr: 0.00001
   grad_clip_norm: 0.1
 
 lr_scheduler:

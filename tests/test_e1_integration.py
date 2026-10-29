@@ -22,7 +22,7 @@ class NamedToyModel(nn.Module):
         self.geometry_e1.horizon_head = nn.Linear(2, 2)
         self.geometry_e1.touchpoint_head = nn.Linear(2, 2)
         self.geometry_e1.feature_adapter = nn.Linear(2, 2)
-        self.geometry_e1.fusion_alpha = nn.Parameter(torch.tensor(0.01))
+        self.geometry_e1.fusion_alpha_logit = nn.Parameter(torch.tensor(-2.0))
 
 
 class E1IntegrationTest(unittest.TestCase):
@@ -89,9 +89,15 @@ class E1IntegrationTest(unittest.TestCase):
             scratch['geometry_e1']['fusion_mode'], 'distribution_level')
         self.assertIsNone(scratch['trainer']['pretrain_model'])
         self.assertEqual(scratch['trainer']['max_epoch'], 195)
+        self.assertEqual(
+            scratch['geometry_e1']['training']['fusion_start_epoch'], 0)
         self.assertAlmostEqual(
             scratch['geometry_e1']['losses'][
                 'pass1_aux_detection_loss_coef_phase2'], 1.0)
+        self.assertAlmostEqual(
+            scratch['geometry_e1']['fusion']['initial_alpha'], 0.01)
+        self.assertAlmostEqual(
+            scratch['optimizer']['param_groups']['fusion_alpha_lr'], 1e-5)
 
     def test_optimizer_groups_every_parameter_once(self):
         model = NamedToyModel()
@@ -110,6 +116,11 @@ class E1IntegrationTest(unittest.TestCase):
         self.assertEqual(rates['base_weight'], 1e-5)
         self.assertEqual(rates['head_weight'], 1e-4)
         self.assertEqual(rates['fusion_weight'], 2e-4)
+        self.assertEqual(rates['fusion_alpha'], 2e-4)
+        alpha_group = next(
+            group for group in optimizer.param_groups
+            if group['group_name'] == 'fusion_alpha')
+        self.assertEqual(alpha_group['weight_decay'], 0)
 
     def test_empty_ground_truth_object_losses_are_finite(self):
         matcher = HungarianMatcher(1, 1, 1, 1)
