@@ -301,7 +301,8 @@ touchpoint và horizon bằng đường nào.
 ### Chặng 5 — Optimizer, train loop và checkpoint
 
 32. `lib/helpers/optimizer_helper.py`
-    - Chia parameter thành base, horizon/touchpoint và geometry/fusion groups.
+    - Chia parameter thành base, horizon/touchpoint, geometry/fusion và
+      fusion-alpha groups; alpha logit không nhận weight decay.
     - Kiểm tra LR từng group trước khi giải thích một curve W&B.
 
 33. `lib/helpers/scheduler_helper.py`

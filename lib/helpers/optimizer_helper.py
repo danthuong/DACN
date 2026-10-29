@@ -9,15 +9,19 @@ def build_optimizer(cfg_optimizer, model):
     base_lr = configured_groups.get('original_monodetr_lr', cfg_optimizer['lr'])
     head_lr = configured_groups.get('horizon_touchpoint_lr', base_lr)
     fusion_lr = configured_groups.get('geometry_fusion_lr', head_lr)
+    alpha_lr = configured_groups.get('fusion_alpha_lr', fusion_lr)
     buckets = {
         ('base', False): [], ('base', True): [],
         ('head', False): [], ('head', True): [],
         ('fusion', False): [], ('fusion', True): [],
+        ('alpha', False): [],
     }
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if 'geometry_e1.horizon_head' in name or 'geometry_e1.touchpoint_head' in name:
+        if name.endswith('geometry_e1.fusion_alpha_logit'):
+            family = 'alpha'
+        elif 'geometry_e1.horizon_head' in name or 'geometry_e1.touchpoint_head' in name:
             family = 'head'
         elif 'geometry_e1' in name:
             family = 'fusion'
@@ -25,15 +29,25 @@ def build_optimizer(cfg_optimizer, model):
             family = 'base'
         buckets[(family, name.endswith('.bias'))].append(param)
 
-    learning_rates = {'base': base_lr, 'head': head_lr, 'fusion': fusion_lr}
+    learning_rates = {
+        'base': base_lr, 'head': head_lr, 'fusion': fusion_lr,
+        'alpha': alpha_lr,
+    }
     parameters = []
     for (family, is_bias), params in buckets.items():
         if params:
+            group_name = (
+                'fusion_alpha' if family == 'alpha'
+                else '{}_{}'.format(family, 'bias' if is_bias else 'weight')
+            )
             parameters.append({
                 'params': params,
                 'lr': learning_rates[family],
-                'weight_decay': 0 if is_bias else cfg_optimizer['weight_decay'],
-                'group_name': '{}_{}'.format(family, 'bias' if is_bias else 'weight'),
+                # The scalar gate is already bounded by a sigmoid. AdamW decay
+                # on its logit creates an unrelated prior on alpha and caused
+                # the old small gate to drift toward its boundary.
+                'weight_decay': 0 if is_bias or family == 'alpha' else cfg_optimizer['weight_decay'],
+                'group_name': group_name,
             })
 
     if cfg_optimizer['type'] == 'sgd':

@@ -164,6 +164,13 @@ python tools/train_val.py --config configs/e1_distribution_scratch_imagenet.yaml
   --env-file .env
 ```
 
+The distribution scratch run initializes the effective fusion gate at `0.01`.
+The gate is represented by an unconstrained logit and mapped into `(0, 0.1)`
+with a sigmoid, so it remains learnable without the zero-gradient boundary of
+the former hard clamp. Its optimizer group uses LR `1e-5` and no weight decay.
+It still executes both decoder passes from epoch 0 and does not load any
+MonoDETR detector checkpoint.
+
 This yields a 2×2 comparison: feature/distribution fusion × pretrained/scratch
 detector initialization, with otherwise aligned training settings.
 

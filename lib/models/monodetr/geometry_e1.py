@@ -495,9 +495,23 @@ class GeometryE1(nn.Module):
         self.log_prior_max = float(mode_cfg.get("log_prior_clamp", [-12.0, 0.0])[1])
         self.register_buffer("depth_bin_values", depth_bin_values.detach().clone(), persistent=False)
 
-        self.fusion_alpha = nn.Parameter(torch.tensor(float(fusion_cfg.get("initial_alpha", 0.01))))
         self.alpha_min = float(fusion_cfg.get("alpha_min", 0.0))
         self.alpha_max = float(fusion_cfg.get("alpha_max", 1.0))
+        initial_alpha = float(fusion_cfg.get("initial_alpha", 0.01))
+        if not self.alpha_min < self.alpha_max:
+            raise ValueError("fusion.alpha_min must be smaller than fusion.alpha_max")
+        if not self.alpha_min < initial_alpha < self.alpha_max:
+            raise ValueError(
+                "fusion.initial_alpha must lie strictly between alpha_min and alpha_max")
+        initial_ratio = (
+            (initial_alpha - self.alpha_min) / (self.alpha_max - self.alpha_min)
+        )
+        initial_logit = math.log(initial_ratio / (1.0 - initial_ratio))
+        # Optimize an unconstrained logit rather than a directly clamped gate.
+        # A hard clamp has zero gradient after the raw parameter crosses a
+        # boundary, which previously made an alpha=0 fusion gate irreversible.
+        self.fusion_alpha_logit = nn.Parameter(
+            torch.tensor(initial_logit, dtype=torch.float32))
         if self.mode == "feature_level":
             self.feature_adapter = nn.Sequential(
                 nn.Conv2d(3, 64, kernel_size=3, padding=1),
@@ -510,7 +524,27 @@ class GeometryE1(nn.Module):
 
     @property
     def alpha(self):
-        return self.fusion_alpha.clamp(self.alpha_min, self.alpha_max)
+        scale = self.alpha_max - self.alpha_min
+        return self.alpha_min + scale * self.fusion_alpha_logit.sigmoid()
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        """Migrate the old directly-clamped alpha stored by E1 checkpoints."""
+        old_key = prefix + "fusion_alpha"
+        new_key = prefix + "fusion_alpha_logit"
+        if old_key in state_dict and new_key not in state_dict:
+            old_alpha = state_dict.pop(old_key).float().clamp(
+                self.alpha_min, self.alpha_max)
+            ratio = (
+                (old_alpha - self.alpha_min)
+                / (self.alpha_max - self.alpha_min)
+            ).clamp(1e-6, 1.0 - 1e-6)
+            state_dict[new_key] = torch.logit(ratio)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
 
     def predict_horizon(self, srcs, image_hw, images=None):
         logits = self.horizon_head(srcs)
