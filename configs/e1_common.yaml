@@ -72,7 +72,7 @@ geometry_e1:
     pass1_aux_detection_loss_coef_phase2: 0.10
     geometric_center_depth_loss_coef: 0.0
   training:
-    fusion_start_epoch: 20
+    fusion_start_epoch: 8
     phase1_decoder_passes: 1
     phase2_decoder_passes: 2
     detach_geometry: false

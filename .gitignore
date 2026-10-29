@@ -6,3 +6,4 @@ __pycache__/
 *.py[cod]
 outputs//Miniconda3-latest-Linux-x86_64.sh
 outputs/
+logs/

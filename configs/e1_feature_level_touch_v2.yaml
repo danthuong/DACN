@@ -1,0 +1,21 @@
+extends: e1_feature_level.yaml
+
+# Stronger touchpoint supervision while preserving the original E1 config as
+# the v1 control. Start this run from the same baseline MonoDETR checkpoint.
+geometry_e1:
+  touchpoint:
+    loss_coordinate_mode: box_relative
+    smooth_l1_beta: 0.05
+    require_inside_image: true
+    box_detach: true
+
+trainer:
+  save_path: outputs/e1_feature_level_touch_v2/
+
+validation:
+  output_dir: outputs/e1_feature_level_touch_v2/validation/
+
+logging:
+  wandb:
+    run_name: e1_feature_level_touch_v2_seed444
+    tags: [monodetr, gpro3d, e1, touch_v2, two_phase, feature_level]
