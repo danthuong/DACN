@@ -49,7 +49,12 @@ def render_e1_example(image_path, artifact_path, prediction_path,
     sx, sy = camera_size[0] / raw_width, camera_size[1] / raw_height
     transform = lambda point: (point[0] * sx, point[1] * sy)
 
-    segment = artifact.get('horizon', {}).get('visible_segment_raw')
+    horizon = artifact.get('horizon', {})
+    segment = horizon.get('visible_segment_raw')
+    raw_segment = horizon.get('raw_visible_segment_raw')
+    if raw_segment and horizon.get('vertical_edge_refinement', {}).get('valid'):
+        camera_draw.line([transform(point) for point in raw_segment],
+                         fill=COLORS['horizon'] + (90,), width=1)
     if segment:
         camera_draw.line([transform(point) for point in segment],
                          fill=COLORS['horizon'] + (235,), width=2)

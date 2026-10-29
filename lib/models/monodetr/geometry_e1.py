@@ -1,4 +1,4 @@
-"""Differentiable geometry modules for the MonoDETR x GPro3D E1 experiment.
+"""Geometry modules for the MonoDETR x GPro3D E1 experiment.
 
 All image coordinates accepted by this module are in the resized network-input
 frame. KITTI axes are X right, Y down, Z forward. Geometric calculations are
@@ -18,6 +18,184 @@ from utils import box_ops
 
 
 TOUCH_POINT_NAMES = ("LF", "RF", "RR", "LR")
+
+
+def _vertical_segments_to_horizon_slope(
+    segments,
+    angle_min_deg: float = 70.0,
+    angle_max_deg: float = 110.0,
+    cluster_tolerance_deg: float = 3.0,
+    min_edge_count: int = 5,
+    max_angle_std_deg: float = 3.0,
+):
+    """Estimate a horizon slope from a coherent cluster of vertical segments.
+
+    Segment orientation is represented in degrees modulo 180, avoiding the
+    infinite numerical slope of a perfectly vertical line. The returned
+    horizon is perpendicular to the length-weighted mean vertical direction.
+    This is the clustering/reliability part of GPro3D Algorithm 1 without a
+    dependency on scikit-learn's BIRCH implementation.
+    """
+    candidates = []
+    for x1, y1, x2, y2 in segments:
+        dx = float(x2) - float(x1)
+        dy = float(y2) - float(y1)
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            continue
+        angle = math.degrees(math.atan2(dy, dx)) % 180.0
+        if angle_min_deg <= angle <= angle_max_deg:
+            candidates.append((angle, length))
+
+    empty = {
+        "valid": False,
+        "horizon_slope": 0.0,
+        "edge_count": 0,
+        "angle_mean_deg": 0.0,
+        "angle_std_deg": 0.0,
+    }
+    if not candidates:
+        return empty
+
+    # Choose the densest local angle neighbourhood. Length weighting prevents
+    # many tiny texture fragments from defeating a few strong structural edges.
+    best_cluster = []
+    best_score = -1.0
+    for center, _ in candidates:
+        cluster = [
+            item for item in candidates
+            if abs(item[0] - center) <= cluster_tolerance_deg
+        ]
+        score = sum(item[1] for item in cluster)
+        if score > best_score:
+            best_cluster = cluster
+            best_score = score
+
+    weight_sum = sum(item[1] for item in best_cluster)
+    angle_mean = sum(angle * length for angle, length in best_cluster) / weight_sum
+    angle_variance = sum(
+        length * (angle - angle_mean) ** 2 for angle, length in best_cluster
+    ) / weight_sum
+    angle_std = math.sqrt(max(angle_variance, 0.0))
+    edge_count = len(best_cluster)
+    angle_rad = math.radians(angle_mean)
+    sine = math.sin(angle_rad)
+    valid = (
+        edge_count >= int(min_edge_count)
+        and angle_std <= float(max_angle_std_deg)
+        and abs(sine) > 1e-6
+    )
+    return {
+        "valid": valid,
+        "horizon_slope": -math.cos(angle_rad) / sine if valid else 0.0,
+        "edge_count": edge_count,
+        "angle_mean_deg": angle_mean,
+        "angle_std_deg": angle_std,
+    }
+
+
+class VerticalEdgeHorizonRefiner(nn.Module):
+    """GPro3D-style OpenCV refinement for evaluation/inference only.
+
+    The operation is intentionally outside the training geometry path because
+    GaussianBlur/Canny/Hough and hard clustering are non-differentiable. It
+    supplies the horizon slope when reliable vertical structure exists. The
+    intercept is subsequently re-fitted from the Horizon Head's ridge.
+    """
+
+    def __init__(self, cfg: Dict):
+        super().__init__()
+        self.enabled = bool(cfg.get("enabled", False))
+        kernel_size = int(cfg.get("gaussian_kernel_size", 13))
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("gaussian_kernel_size must be a positive odd integer")
+        self.gaussian_kernel_size = kernel_size
+        self.gaussian_sigma = float(cfg.get("gaussian_sigma", 4.0))
+        canny = cfg.get("canny_thresholds", [50, 100])
+        if len(canny) != 2 or float(canny[0]) >= float(canny[1]):
+            raise ValueError("canny_thresholds must be [low, high]")
+        self.canny_low, self.canny_high = int(canny[0]), int(canny[1])
+        self.hough_threshold = int(cfg.get("hough_threshold", 5))
+        self.min_line_length = float(cfg.get("min_line_length_px", 40.0))
+        self.max_line_gap = float(cfg.get("max_line_gap_px", 10.0))
+        angle_range = cfg.get("vertical_angle_range_deg", [70.0, 110.0])
+        if len(angle_range) != 2 or float(angle_range[0]) >= float(angle_range[1]):
+            raise ValueError("vertical_angle_range_deg must be [minimum, maximum]")
+        self.angle_min, self.angle_max = float(angle_range[0]), float(angle_range[1])
+        self.cluster_tolerance = float(cfg.get("cluster_tolerance_deg", 3.0))
+        self.min_edge_count = int(cfg.get("min_edge_count", 5))
+        self.max_angle_std = float(cfg.get("max_angle_std_deg", 3.0))
+        self.register_buffer(
+            "image_mean",
+            torch.tensor(cfg.get("image_mean", [0.485, 0.456, 0.406])).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "image_std",
+            torch.tensor(cfg.get("image_std", [0.229, 0.224, 0.225])).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    @torch.no_grad()
+    def forward(self, images: torch.Tensor, raw_line: torch.Tensor):
+        batch = raw_line.shape[0]
+        refined = raw_line.detach().float().clone()
+        valid = torch.zeros(batch, dtype=torch.bool, device=raw_line.device)
+        edge_count = torch.zeros(batch, dtype=torch.long, device=raw_line.device)
+        angle_mean = torch.zeros(batch, dtype=torch.float32, device=raw_line.device)
+        angle_std = torch.zeros(batch, dtype=torch.float32, device=raw_line.device)
+        if not self.enabled:
+            return refined.to(raw_line.dtype), valid, edge_count, angle_mean, angle_std
+
+        try:
+            import cv2
+        except Exception as error:
+            raise RuntimeError(
+                "vertical-edge refinement is enabled but OpenCV is unavailable"
+            ) from error
+
+        rgb_batch = (
+            images.detach().float() * self.image_std + self.image_mean
+        ).clamp(0.0, 1.0)
+        rgb_batch = (
+            rgb_batch.mul(255.0).round().byte().permute(0, 2, 3, 1).cpu().numpy()
+        )
+        for batch_index, rgb in enumerate(rgb_batch):
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            blurred = cv2.GaussianBlur(
+                gray,
+                (self.gaussian_kernel_size, self.gaussian_kernel_size),
+                sigmaX=self.gaussian_sigma,
+                sigmaY=self.gaussian_sigma,
+            )
+            edges = cv2.Canny(
+                blurred, self.canny_low, self.canny_high, apertureSize=3
+            )
+            detected = cv2.HoughLinesP(
+                edges,
+                rho=1,
+                theta=math.pi / 180.0,
+                threshold=self.hough_threshold,
+                minLineLength=self.min_line_length,
+                maxLineGap=self.max_line_gap,
+            )
+            segments = [] if detected is None else detected.reshape(-1, 4).tolist()
+            estimate = _vertical_segments_to_horizon_slope(
+                segments,
+                self.angle_min,
+                self.angle_max,
+                self.cluster_tolerance,
+                self.min_edge_count,
+                self.max_angle_std,
+            )
+            edge_count[batch_index] = int(estimate["edge_count"])
+            angle_mean[batch_index] = float(estimate["angle_mean_deg"])
+            angle_std[batch_index] = float(estimate["angle_std_deg"])
+            if estimate["valid"]:
+                valid[batch_index] = True
+                refined[batch_index, 0] = float(estimate["horizon_slope"])
+
+        return refined.to(raw_line.dtype), valid, edge_count, angle_mean, angle_std
 
 
 class HorizonHead(nn.Module):
@@ -104,6 +282,29 @@ def decode_horizon_line(
         - slope * (scale_x - 1.0) / 2.0
     )
     return torch.stack((slope, intercept), dim=-1), expected_row, confidence
+
+
+def refit_horizon_intercept(
+    slope: torch.Tensor,
+    expected_row: torch.Tensor,
+    confidence: torch.Tensor,
+    input_hw: Tuple[int, int],
+    heatmap_hw: Tuple[int, int],
+) -> torch.Tensor:
+    """Fit only ``b`` in ``v = slope*u + b`` from the learned heatmap ridge."""
+    heatmap_h, heatmap_w = int(heatmap_hw[0]), int(heatmap_hw[1])
+    input_h, input_w = int(input_hw[0]), int(input_hw[1])
+    scale_x = float(input_w) / float(heatmap_w)
+    scale_y = float(input_h) / float(heatmap_h)
+    columns = torch.arange(
+        heatmap_w, device=expected_row.device, dtype=torch.float32
+    ).view(1, -1)
+    input_columns = scale_x * columns + (scale_x - 1.0) / 2.0
+    input_rows = scale_y * expected_row.float() + (scale_y - 1.0) / 2.0
+    weights = confidence.float()
+    return (
+        weights * (input_rows - slope.float()[:, None] * input_columns)
+    ).sum(dim=1) / weights.sum(dim=1).clamp_min(1e-6)
 
 
 def make_horizon_heatmap_target(
@@ -271,6 +472,8 @@ class GeometryE1(nn.Module):
         mode_cfg = fusion_cfg.get("mode_settings", {})
 
         self.horizon_head = HorizonHead(hidden_dim, int(horizon_cfg.get("fpn_channels", 128)))
+        self.vertical_edge_refiner = VerticalEdgeHorizonRefiner(
+            horizon_cfg.get("vertical_edge_refinement", {}))
         self.touchpoint_head = TouchpointHead(
             hidden_dim,
             int(point_cfg.get("max_touchpoints", 4)),
@@ -309,15 +512,45 @@ class GeometryE1(nn.Module):
     def alpha(self):
         return self.fusion_alpha.clamp(self.alpha_min, self.alpha_max)
 
-    def predict_horizon(self, srcs, image_hw):
+    def predict_horizon(self, srcs, image_hw, images=None):
         logits = self.horizon_head(srcs)
-        line, expected_row, confidence = decode_horizon_line(
+        raw_line, expected_row, confidence = decode_horizon_line(
             logits,
             image_hw,
             temperature=self.softargmax_temperature,
             entropy_confidence=self.entropy_confidence,
         )
-        return logits, line, expected_row, confidence
+        batch = raw_line.shape[0]
+        refined_line = raw_line
+        edge_valid = torch.zeros(batch, dtype=torch.bool, device=raw_line.device)
+        edge_count = torch.zeros(batch, dtype=torch.long, device=raw_line.device)
+        edge_angle = torch.zeros(batch, dtype=torch.float32, device=raw_line.device)
+        edge_angle_std = torch.zeros(batch, dtype=torch.float32, device=raw_line.device)
+        # OpenCV refinement is a hard, non-differentiable post-process. Keep it
+        # out of training so pass-2 losses can still optimize the Horizon Head.
+        if not self.training and self.vertical_edge_refiner.enabled:
+            if images is None:
+                raise ValueError("images are required for vertical-edge refinement")
+            (refined_line, edge_valid, edge_count,
+             edge_angle, edge_angle_std) = self.vertical_edge_refiner(
+                images, raw_line)
+            refined_intercept = refit_horizon_intercept(
+                refined_line[:, 0], expected_row, confidence,
+                image_hw, logits.shape[-2:])
+            refined_line[:, 1] = torch.where(
+                edge_valid, refined_intercept.to(refined_line.dtype),
+                raw_line[:, 1])
+        return {
+            "logits": logits,
+            "raw_line": raw_line,
+            "line": refined_line,
+            "expected_row": expected_row,
+            "confidence": confidence,
+            "vertical_edge_valid": edge_valid,
+            "vertical_edge_count": edge_count,
+            "vertical_edge_angle_deg": edge_angle,
+            "vertical_edge_angle_std_deg": edge_angle_std,
+        }
 
     def predict_geometry(
         self,
@@ -470,4 +703,3 @@ def horizon_focal_loss(logits: torch.Tensor, target: torch.Tensor, mask: torch.T
     positive = -target * (1.0 - probability).square() * F.logsigmoid(logits)
     negative = -(1.0 - target).pow(4) * probability.square() * F.logsigmoid(-logits)
     return ((positive + negative) * mask).sum() / mask.sum().clamp_min(1.0)
-

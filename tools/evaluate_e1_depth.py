@@ -124,6 +124,7 @@ def official_kitti_metrics(gt_dir, prediction_dir, frame_ids, class_name):
         gt_annos, dt_annos, class_ids[class_name]
     )
     _, values = official_result[:2]
+    return values
 
 
 def evaluate(args):

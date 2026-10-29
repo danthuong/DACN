@@ -97,16 +97,18 @@ class Tester(object):
 
     def _save_e1_artifacts(self, outputs, selected_outputs, info, inputs,
                            output_name, topk):
-        if 'geometry' not in outputs:
-            return
         root = Path(self._result_root(output_name)) / 'artifacts'
         root.mkdir(parents=True, exist_ok=True)
-        geometry = outputs['geometry']
+        geometry = outputs.get('geometry')
         logits = selected_outputs['pred_logits'].detach().float()
         boxes = selected_outputs['pred_boxes'].detach().float()
         depths = selected_outputs['pred_depth'][..., 0].detach().float()
+        selected_depth_predictor = selected_outputs[
+            'pred_depth_predictor_sample'].detach().float()
         pass1 = outputs.get('pass1_outputs', outputs)
         pass1_depths = pass1['pred_depth'][..., 0].detach().float()
+        original_depth_predictor = pass1[
+            'pred_depth_predictor_sample'].detach().float()
         probabilities = logits.sigmoid()
         scores, flat_indices = torch.topk(
             probabilities.flatten(1), min(topk, probabilities.shape[1] * probabilities.shape[2]), dim=1)
@@ -131,14 +133,20 @@ class Tester(object):
                     'detection_id': kept_rank,
                     'query_id': query_index,
                     'class_id': class_index,
+                    'class_name': self.class_name[class_index],
                     'class_score': score,
                     'bbox_xyxy_normalized': box_xyxy.tolist(),
                     'bbox_xyxy_raw': self._to_raw_pixels(
                         box_xyxy.reshape(2, 2), affine, input_hw),
                     'pass1_depth_m': float(pass1_depths[batch_index, query_index]),
                     'selected_depth_m': float(depths[batch_index, query_index]),
+                    'depth_predictor_depth_m': float(
+                        original_depth_predictor[batch_index, query_index]),
+                    'selected_depth_predictor_depth_m': float(
+                        selected_depth_predictor[batch_index, query_index]),
                 }
-                if query_index < geometry['object_depth'].shape[1]:
+                if (geometry is not None
+                        and query_index < geometry['object_depth'].shape[1]):
                     touch = geometry['touchpoints_abs'][batch_index, query_index].detach().float().cpu().numpy()
                     record.update({
                         'touchpoints_normalized': touch.tolist(),
@@ -155,13 +163,8 @@ class Tester(object):
                 detections.append(record)
                 kept_rank += 1
 
-            horizon = outputs['pred_horizon_line'][batch_index].detach().float().cpu().numpy()
-            network_segment = np.asarray([
-                [0.0, horizon[1]],
-                [float(input_hw[1] - 1), horizon[0] * float(input_hw[1] - 1) + horizon[1]],
-            ])
             payload = {
-                'schema_version': 'monodetr-e1-inference-v1',
+                'schema_version': 'monodetr-depth-inference-v2',
                 'model_variant': output_name or self.output_variant,
                 'frame_id': '{:06d}'.format(image_id),
                 'network_input_size': [input_hw[1], input_hw[0]],
@@ -169,24 +172,58 @@ class Tester(object):
                     int(info['img_size'][batch_index, 0]),
                     int(info['img_size'][batch_index, 1]),
                 ],
-                'horizon': {
-                    'line_network': horizon.tolist(),
-                    'visible_segment_raw': self._to_raw_pixels(
-                        network_segment, affine, input_hw),
-                },
-                'ground_plane': {
-                    'coefficients': geometry['plane'][batch_index].detach().float().cpu().tolist(),
-                    'valid': bool(geometry['plane_valid'][batch_index]),
-                    'camera_height_assumption_m': float(
-                        (self.model.module if hasattr(self.model, 'module') else self.model)
-                        .geometry_e1.camera_height_m),
-                },
-                'horizon_reliability': float(
-                    geometry['horizon_reliability'][batch_index]),
                 'fusion_alpha': float(outputs['fusion_alpha'].detach())
                     if 'fusion_alpha' in outputs else None,
                 'detections': detections,
             }
+            if geometry is not None:
+                horizon = outputs['pred_horizon_line'][
+                    batch_index].detach().float().cpu().numpy()
+                raw_horizon = outputs.get(
+                    'pred_horizon_line_raw', outputs['pred_horizon_line']
+                )[batch_index].detach().float().cpu().numpy()
+                network_segment = np.asarray([
+                    [0.0, horizon[1]],
+                    [float(input_hw[1] - 1),
+                     horizon[0] * float(input_hw[1] - 1) + horizon[1]],
+                ])
+                raw_network_segment = np.asarray([
+                    [0.0, raw_horizon[1]],
+                    [float(input_hw[1] - 1),
+                     raw_horizon[0] * float(input_hw[1] - 1) + raw_horizon[1]],
+                ])
+                payload.update({
+                    'horizon': {
+                        'line_network': horizon.tolist(),
+                        'raw_line_network': raw_horizon.tolist(),
+                        'refined_line_network': horizon.tolist(),
+                        'visible_segment_raw': self._to_raw_pixels(
+                            network_segment, affine, input_hw),
+                        'raw_visible_segment_raw': self._to_raw_pixels(
+                            raw_network_segment, affine, input_hw),
+                        'vertical_edge_refinement': {
+                            'valid': bool(
+                                outputs['vertical_edge_valid'][batch_index]),
+                            'edge_count': int(
+                                outputs['vertical_edge_count'][batch_index]),
+                            'angle_deg': float(
+                                outputs['vertical_edge_angle_deg'][batch_index]),
+                            'angle_std_deg': float(
+                                outputs['vertical_edge_angle_std_deg'][batch_index]),
+                        },
+                    },
+                    'ground_plane': {
+                        'coefficients': geometry['plane'][batch_index]
+                            .detach().float().cpu().tolist(),
+                        'valid': bool(geometry['plane_valid'][batch_index]),
+                        'camera_height_assumption_m': float(
+                            (self.model.module
+                             if hasattr(self.model, 'module') else self.model)
+                            .geometry_e1.camera_height_m),
+                    },
+                    'horizon_reliability': float(
+                        geometry['horizon_reliability'][batch_index]),
+                })
             (root / '{:06d}.json'.format(image_id)).write_text(
                 json.dumps(payload, separators=(',', ':')) + '\n', encoding='utf-8')
 

@@ -202,6 +202,7 @@ class MonoDETR(nn.Module):
          enc_outputs_class, enc_outputs_coord_unact) = transformer_outputs
         outputs_coords, outputs_classes = [], []
         outputs_3d_dims, outputs_depths, outputs_angles = [], [], []
+        outputs_depth_predictor_samples = []
 
         for lvl in range(hs.shape[0]):
             reference = init_reference if lvl == 0 else inter_references[lvl - 1]
@@ -227,6 +228,7 @@ class MonoDETR(nn.Module):
             depth_map = F.grid_sample(
                 weighted_depth.unsqueeze(1), outputs_center3d,
                 mode='bilinear', align_corners=True).squeeze(1)
+            outputs_depth_predictor_samples.append(depth_map.squeeze(-1))
             depth_ave = torch.cat([
                 ((1. / (depth_reg[:, :, 0:1].sigmoid() + 1e-6) - 1.)
                  + depth_geo.unsqueeze(-1) + depth_map) / 3,
@@ -239,11 +241,16 @@ class MonoDETR(nn.Module):
         outputs_3d_dim = torch.stack(outputs_3d_dims)
         outputs_depth = torch.stack(outputs_depths)
         outputs_angle = torch.stack(outputs_angles)
+        outputs_depth_predictor_sample = torch.stack(
+            outputs_depth_predictor_samples)
         out = {
             'pred_logits': outputs_class[-1],
             'pred_boxes': outputs_coord[-1],
             'pred_3d_dim': outputs_3d_dim[-1],
             'pred_depth': outputs_depth[-1],
+            # Pure weighted-depth map sampled at each projected query centre,
+            # before averaging with size-based and query-regressed depth.
+            'pred_depth_predictor_sample': outputs_depth_predictor_sample[-1],
             'pred_angle': outputs_angle[-1],
             'pred_depth_map_logits': depth_map_logits,
             '_query_features': hs[-1],
@@ -318,8 +325,11 @@ class MonoDETR(nn.Module):
             return pass1
 
         image_hw = (images.shape[-2], images.shape[-1])
-        horizon_logits, horizon_line, horizon_rows, horizon_confidence = (
-            self.geometry_e1.predict_horizon(srcs, image_hw))
+        horizon = self.geometry_e1.predict_horizon(srcs, image_hw, images)
+        horizon_logits = horizon['logits']
+        horizon_line = horizon['line']
+        horizon_rows = horizon['expected_row']
+        horizon_confidence = horizon['confidence']
         p2_input = self._input_frame_calibration(
             images, calibs, img_sizes, geometry_calibs)
         geometry = self.geometry_e1.predict_geometry(
@@ -329,8 +339,14 @@ class MonoDETR(nn.Module):
         pass1.update({
             'pred_horizon_logits': horizon_logits,
             'pred_horizon_line': horizon_line,
+            'pred_horizon_line_raw': horizon['raw_line'],
+            'pred_horizon_line_refined': horizon_line,
             'pred_horizon_rows': horizon_rows,
             'pred_horizon_confidence': horizon_confidence,
+            'vertical_edge_valid': horizon['vertical_edge_valid'],
+            'vertical_edge_count': horizon['vertical_edge_count'],
+            'vertical_edge_angle_deg': horizon['vertical_edge_angle_deg'],
+            'vertical_edge_angle_std_deg': horizon['vertical_edge_angle_std_deg'],
             'pred_touchpoints': geometry['touchpoints_abs'],
             'pred_touchpoints_rel': geometry['touchpoints_rel'],
             'geometry': geometry,
@@ -365,8 +381,14 @@ class MonoDETR(nn.Module):
             'original_depth_map_logits': original_depth_logits,
             'pred_horizon_logits': horizon_logits,
             'pred_horizon_line': horizon_line,
+            'pred_horizon_line_raw': horizon['raw_line'],
+            'pred_horizon_line_refined': horizon_line,
             'pred_horizon_rows': horizon_rows,
             'pred_horizon_confidence': horizon_confidence,
+            'vertical_edge_valid': horizon['vertical_edge_valid'],
+            'vertical_edge_count': horizon['vertical_edge_count'],
+            'vertical_edge_angle_deg': horizon['vertical_edge_angle_deg'],
+            'vertical_edge_angle_std_deg': horizon['vertical_edge_angle_std_deg'],
             'pred_touchpoints': geometry['touchpoints_abs'],
             'pred_touchpoints_rel': geometry['touchpoints_rel'],
             'geometry': geometry,
@@ -599,7 +621,9 @@ class SetCriterion(nn.Module):
 
     def loss_horizon(self, outputs, targets, indices, num_boxes):
         logits = outputs['pred_horizon_logits']
-        predicted_line = outputs['pred_horizon_line']
+        # Supervise the learned line, never the non-differentiable OpenCV
+        # refinement used by eval/inference.
+        predicted_line = outputs.get('pred_horizon_line_raw', outputs['pred_horizon_line'])
         target_line = torch.stack([target['horizon_line'] for target in targets]).to(logits)
         valid = torch.stack([target['horizon_valid'] for target in targets]).bool().to(logits.device)
         input_hw = (

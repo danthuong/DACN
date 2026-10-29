@@ -4,10 +4,12 @@ import torch
 
 from lib.models.monodetr.geometry_e1 import (
     GeometryE1,
+    _vertical_segments_to_horizon_slope,
     decode_horizon_line,
     horizon_line_to_ground_plane,
     make_horizon_heatmap_target,
     raycast_touchpoints_to_plane,
+    refit_horizon_intercept,
 )
 
 
@@ -54,6 +56,44 @@ class GeometryE1Test(unittest.TestCase):
         self.assertTrue(mask.any())
         self.assertAlmostEqual(decoded[0, 0].item(), 0.0, places=4)
         self.assertAlmostEqual(decoded[0, 1].item(), 180.0, delta=0.6)
+
+    def test_vertical_edges_produce_perpendicular_horizon_slope(self):
+        # Each vertical segment has kv=dy/dx=10, hence kh=-1/kv=-0.1.
+        segments = [
+            [10 + index * 20, 10, 20 + index * 20, 110]
+            for index in range(6)
+        ]
+        estimate = _vertical_segments_to_horizon_slope(
+            segments, min_edge_count=5)
+        self.assertTrue(estimate["valid"])
+        self.assertEqual(estimate["edge_count"], 6)
+        self.assertAlmostEqual(estimate["horizon_slope"], -0.1, places=5)
+
+    def test_fixed_vertical_edge_slope_refits_horizon_intercept(self):
+        columns = torch.arange(20, dtype=torch.float32).view(1, -1)
+        expected_rows = 0.1 * columns + 3.0
+        intercept = refit_horizon_intercept(
+            torch.tensor([0.1]), expected_rows, torch.ones_like(expected_rows),
+            (10, 20), (10, 20))
+        self.assertAlmostEqual(intercept.item(), 3.0, places=5)
+
+    def test_vertical_edge_refinement_is_bypassed_during_training(self):
+        cfg = geometry_cfg()
+        cfg["horizon"]["vertical_edge_refinement"] = {"enabled": True}
+        module = GeometryE1(cfg, 256, 50, self.bin_values)
+        module.train()
+        srcs = [
+            torch.randn(1, 256, 8, 16, requires_grad=True),
+            torch.randn(1, 256, 4, 8, requires_grad=True),
+            torch.randn(1, 256, 2, 4, requires_grad=True),
+        ]
+        result = module.predict_horizon(
+            srcs, (32, 64), torch.randn(1, 3, 32, 64))
+        torch.testing.assert_close(result["line"], result["raw_line"])
+        self.assertFalse(result["vertical_edge_valid"].any())
+        result["line"].sum().backward()
+        self.assertIsNotNone(srcs[0].grad)
+        self.assertGreater(srcs[0].grad.abs().sum().item(), 0.0)
 
     def test_flat_horizon_plane_and_road_raycast(self):
         plane, plane_valid = horizon_line_to_ground_plane(
