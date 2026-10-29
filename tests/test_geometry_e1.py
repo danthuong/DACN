@@ -4,6 +4,7 @@ import torch
 
 from lib.models.monodetr.geometry_e1 import (
     GeometryE1,
+    TouchpointHead,
     _vertical_segments_to_horizon_slope,
     decode_horizon_line,
     horizon_line_to_ground_plane,
@@ -56,6 +57,16 @@ class GeometryE1Test(unittest.TestCase):
         self.assertTrue(mask.any())
         self.assertAlmostEqual(decoded[0, 0].item(), 0.0, places=4)
         self.assertAlmostEqual(decoded[0, 1].item(), 180.0, delta=0.6)
+
+    def test_touchpoint_head_accepts_and_applies_configured_offset_range(self):
+        head = TouchpointHead(hidden_dim=8, max_touchpoints=4, offset_range=[0.0, 1.0])
+        query_features = torch.randn(2, 3, 8)
+        boxes = torch.tensor([0.5, 0.5, 0.2, 0.2, 0.2, 0.2]).expand(2, 3, 6)
+        _, relative, _ = head(query_features, boxes)
+
+        self.assertEqual(relative.shape, (2, 3, 4, 2))
+        self.assertTrue((relative >= 0.0).all())
+        self.assertTrue((relative <= 1.0).all())
 
     def test_vertical_edges_produce_perpendicular_horizon_slope(self):
         # Each vertical segment has kv=dy/dx=10, hence kh=-1/kv=-0.1.

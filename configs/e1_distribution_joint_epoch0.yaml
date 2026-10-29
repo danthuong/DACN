@@ -9,9 +9,9 @@ geometry_e1:
     vertical_edge_refinement:
       enabled: false
   fusion:
-    initial_alpha: 0.001
-    alpha_min: 0.0
-    alpha_max: 0.1
+    initial_alpha: 0.01
+    alpha_min: 0.01
+    alpha_max: 0.01
   losses:
     fused_depth_map_loss_coef: 0.25
     pass1_aux_detection_loss_coef_phase2: 0.50

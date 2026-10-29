@@ -4,7 +4,7 @@ random_seed: 444
 
 dataset:
   root_dir: "${KITTI_ROOT:-data/KITTIDataset}"
-  batch_size: 12
+  batch_size: 16
   aug_pd: true
   aug_crop: false
   aug_calib: false

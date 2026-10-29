@@ -337,9 +337,18 @@ def make_horizon_heatmap_target(
 
 
 class TouchpointHead(nn.Module):
-    def __init__(self, hidden_dim: int = 256, max_touchpoints: int = 4):
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        max_touchpoints: int = 4,
+        offset_range: Sequence[float] = (-0.25, 1.25),
+    ):
         super().__init__()
         self.max_touchpoints = max_touchpoints
+        if len(offset_range) != 2 or float(offset_range[0]) >= float(offset_range[1]):
+            raise ValueError("touchpoint.offset_range must be [minimum, maximum]")
+        self.offset_min = float(offset_range[0])
+        self.offset_max = float(offset_range[1])
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -352,7 +361,10 @@ class TouchpointHead(nn.Module):
         raw = self.mlp(query_features).view(
             *query_features.shape[:-1], self.max_touchpoints, 2
         )
-        relative = 1.5 * raw.sigmoid() - 0.25
+        relative = (
+            (self.offset_max - self.offset_min) * raw.sigmoid()
+            + self.offset_min
+        )
         xyxy = box_ops.box_cxcylrtb_to_xyxy(boxes)
         top_left = xyxy[..., None, :2]
         size = (xyxy[..., 2:] - xyxy[..., :2]).clamp_min(1e-6)[..., None, :]
