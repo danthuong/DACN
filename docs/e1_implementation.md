@@ -153,6 +153,20 @@ vertical-edge eval-only refinement. The pretrained run keeps Pass-1 detection
 at weight `0.5`; scratch keeps it at `1.0`. These are intentionally separate
 output/W&B runs and should not resume from one another.
 
+The matching distribution-level experiments use the same protocol and differ
+only in where the geometry prior is injected:
+
+```bash
+python tools/train_val.py --config configs/e1_distribution_joint_epoch0.yaml \
+  --env-file .env
+
+python tools/train_val.py --config configs/e1_distribution_scratch_imagenet.yaml \
+  --env-file .env
+```
+
+This yields a 2×2 comparison: feature/distribution fusion × pretrained/scratch
+detector initialization, with otherwise aligned training settings.
+
 ## Export and fair evaluation
 
 First export the untouched baseline once on the exact same `val` loader:
