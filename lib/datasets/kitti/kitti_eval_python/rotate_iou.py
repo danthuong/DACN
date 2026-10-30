@@ -4,10 +4,12 @@
 # Author: yanyan, scrin@foxmail.com
 #####################
 import math
+import warnings
 
 import numba
 import numpy as np
 from numba import cuda
+from numba.core.errors import NumbaPerformanceWarning
 
 
 @numba.jit(nopython=True)
@@ -324,7 +326,11 @@ def rotate_iou_gpu_eval(boxes, query_boxes, criterion=-1, device_id=0):
         boxes_dev = cuda.to_device(boxes.reshape([-1]), stream)
         query_boxes_dev = cuda.to_device(query_boxes.reshape([-1]), stream)
         iou_dev = cuda.to_device(iou.reshape([-1]), stream)
-        rotate_iou_kernel_eval[blockspergrid, threadsPerBlock, stream](
-            N, K, boxes_dev, query_boxes_dev, iou_dev, criterion)
+        # Small KITTI partitions legitimately launch fewer blocks than the GPU
+        # can occupy. This is expected for evaluation and does not affect IoU.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", NumbaPerformanceWarning)
+            rotate_iou_kernel_eval[blockspergrid, threadsPerBlock, stream](
+                N, K, boxes_dev, query_boxes_dev, iou_dev, criterion)
         iou_dev.copy_to_host(iou.reshape([-1]), stream=stream)
     return iou.astype(boxes.dtype)

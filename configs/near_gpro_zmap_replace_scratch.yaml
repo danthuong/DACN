@@ -6,7 +6,7 @@ random_seed: 444
 model_name: near_gpro_zmap_replace_scratch
 
 dataset:
-  batch_size: 8
+  batch_size: 20
   meanshape: false
   # Geometry labels and the projection matrix must stay in the same frame.
   # Photometric augmentation is safe; crop/flip are disabled for the first run.
@@ -127,6 +127,6 @@ logging:
   wandb:
     enabled: true
     mode: "${WANDB_MODE:-offline}"
-    project: monodetr-gpro3d-e1
+    project: DACN
     run_name: near_gpro_zmap_replace_scratch_seed444
     tags: [monodetr, gpro3d, near_center, box_relative, zmap_replacement, scratch]

@@ -6,7 +6,7 @@ from .rotate_iou import rotate_iou_gpu_eval
 DISTANCE_COVER = False
 
 
-@numba.jit
+@numba.jit(nopython=True)
 def get_thresholds(scores: np.ndarray, num_gt, num_sample_pts=41):
     scores.sort()
     scores = scores[::-1]
@@ -198,7 +198,7 @@ def bev_box_overlap(boxes, qboxes, criterion=-1):
 def d3_box_overlap_kernel(boxes, qboxes, rinc, criterion=-1):
     # ONLY support overlap in CAMERA, not lider.
     N, K = boxes.shape[0], qboxes.shape[0]
-    for i in range(N):
+    for i in numba.prange(N):
         for j in range(K):
             if rinc[i, j] > 0:
                 # iw = (min(boxes[i, 1] + boxes[i, 4], qboxes[j, 1] +

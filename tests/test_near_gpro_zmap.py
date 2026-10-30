@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from lib.models.monodetr.near_gpro_zmap import NearGProGeometry
+from lib.models.monodetr.near_gpro_zmap import NearContactROIHead, NearGProGeometry
 
 
 def _geometry():
@@ -11,6 +11,23 @@ def _geometry():
         "near_touchpoint": {"roi_channels": 64},
         "center_correction": {"k_l": 0.65, "k_w": 0.85},
     })
+
+
+def test_near_contact_roi_head_supports_project_torch_meshgrid_api():
+    head = NearContactROIHead({"roi_size": 5, "roi_channels": 64})
+    feature = torch.randn(2, 256, 8, 16, requires_grad=True)
+    boxes = torch.tensor(
+        [0.5, 0.5, 0.2, 0.2, 0.2, 0.2], dtype=feature.dtype
+    ).view(1, 1, 6).expand(2, 3, 6)
+
+    result = head(feature, boxes)
+
+    assert result["logits"].shape == (2, 3, 5, 5)
+    assert result["relative"].shape == (2, 3, 2)
+    assert torch.isfinite(result["absolute"]).all()
+    result["absolute"].sum().backward()
+    assert feature.grad is not None
+    assert torch.isfinite(feature.grad).all()
 
 
 def test_near_edge_offset_recovers_bottom_center_for_axis_aligned_car():

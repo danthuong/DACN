@@ -79,7 +79,9 @@ class NearContactROIHead(nn.Module):
             device=feature.device,
             dtype=feature.dtype,
         )
-        rel_y, rel_x = torch.meshgrid(coordinates, coordinates, indexing="ij")
+        # PyTorch 1.9 uses ``ij`` ordering by default and does not yet accept
+        # the explicit ``indexing`` keyword introduced in later releases.
+        rel_y, rel_x = torch.meshgrid(coordinates, coordinates)
         rel_x = rel_x.view(1, 1, size, size)
         rel_y = rel_y.view(1, 1, size, size)
         xmin, ymin, xmax, ymax = boxes_xyxy.unbind(dim=-1)
