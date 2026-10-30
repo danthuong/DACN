@@ -1,4 +1,76 @@
-# Task: GPro3D Geometry Pseudo-Labels + Minimal MonoDETR Visualization Dashboard
+# MonoDETR Geometry Debugger
+
+The dashboard can use existing KITTI prediction files or run selected
+checkpoints live on one image. It keeps exactly two primary views: the raw
+camera image and the camera-centric BEV comparison.
+
+## Start the dashboard
+
+From the repository root:
+
+```bash
+python3 dashboard/server.py \
+  --dataset-root data/KITTIDataset \
+  --split val \
+  --pseudo-labels outputs/near_gpro_pseudo_labels/val.jsonl \
+  --device cuda:0
+```
+
+Open <http://127.0.0.1:8765>. If CUDA is omitted, `--device auto` uses CUDA
+when available and otherwise falls back to CPU. Models are loaded lazily,
+cached on CPU, and moved to the selected device one at a time so comparing
+several versions does not keep all of them in GPU memory.
+
+In **Models & weights**, enable the original MonoDETR and any custom model,
+choose one checkpoint for each, then press **Run**. The server uses the
+checkpoint's `resolved_config` when present and its registry config as a
+fallback. The confidence slider filters the returned top-k detections without
+running inference again.
+
+The camera overlay uses:
+
+- magenta dashed line: pseudo-label horizon;
+- model-coloured dotted line: raw predicted horizon;
+- model-coloured solid line: vertically refined horizon, only when refinement
+  is valid;
+- white diamond: GT near-edge midpoint;
+- model-coloured dot: predicted near touchpoint (or the four E1 touchpoints);
+- each predicted box label: `Zpred` and the 2D-IoU-matched `Zgt`.
+
+Click a matched box to show `Zpred`, `Zgt`, `delta Z`, predicted touchpoint
+pixel coordinates, and `Zgeo` in the BEV tooltip. Matching is class-constrained,
+one-to-one Hungarian assignment on raw-image 2D IoU >= 0.5; it does not use
+depth to decide the match. Original MonoDETR has no horizon/touchpoint head, so those fields
+correctly appear as unavailable while its boxes and final depth remain visible.
+
+The server automatically prefers
+`outputs/near_gpro_pseudo_labels/<split>.jsonl` when `--pseudo-labels` is not
+specified, falling back to the original geometry pseudo-label file.
+
+## Register checkpoints
+
+Edit `dashboard/model_registry.json`. A live model entry supports explicit
+weights and checkpoint globs:
+
+```json
+{
+  "inference": {
+    "builder": "near_gpro",
+    "config": "configs/near_gpro_zmap_replace_scratch.yaml",
+    "default_weight": "best",
+    "weights": [
+      {"id": "best", "label": "best AP", "path": "outputs/run/model/checkpoint_best.pth"}
+    ],
+    "checkpoint_globs": ["outputs/run/model/checkpoint_epoch_*.pth"]
+  }
+}
+```
+
+Only checkpoint files that currently exist are exposed in the browser. Use
+`builder: monodetr`, `e1`, or `near_gpro` to select the correct constructor.
+Restart the dashboard after changing the registry or adding checkpoints.
+
+## Original implementation brief
 
 You are working in my existing MonoDETR research repository.
 

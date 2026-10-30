@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import glob
+import hashlib
 import json
 import mimetypes
 import re
@@ -37,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", default="dashboard/model_registry.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--device", default="auto", help="live inference device: auto, cpu, cuda, cuda:0, ...")
+    parser.add_argument("--topk", type=int, default=50)
     return parser.parse_args()
 
 
@@ -174,7 +178,16 @@ class DashboardData:
         self.frame_set = set(self.frame_ids)
         self.data_dir = self.dataset_root / ("testing" if self.split == "test" else "training")
 
-        pseudo_path = Path(args.pseudo_labels or f"outputs/geometry_pseudo_labels/{self.split}.jsonl")
+        if args.pseudo_labels:
+            pseudo_path = Path(args.pseudo_labels)
+        else:
+            # Prefer the extended records because they contain the near-edge
+            # midpoint GT requested by the near-GPro experiment. They retain
+            # the original four wheel contacts and horizon/plane labels too.
+            near_path = REPO_ROOT / f"outputs/near_gpro_pseudo_labels/{self.split}.jsonl"
+            pseudo_path = near_path if near_path.is_file() else Path(
+                f"outputs/geometry_pseudo_labels/{self.split}.jsonl"
+            )
         if not pseudo_path.is_absolute():
             pseudo_path = REPO_ROOT / pseudo_path
         self.pseudo_path = pseudo_path
@@ -209,20 +222,78 @@ class DashboardData:
         for model in payload.get("models", []):
             if model.get("format") != "kitti":
                 raise ValueError(f"Unsupported model format for {model.get('id')}: {model.get('format')}")
-            prediction_dir = Path(model["prediction_dir"])
-            if not prediction_dir.is_absolute():
-                prediction_dir = REPO_ROOT / prediction_dir
             model = dict(model)
-            model["prediction_dir"] = prediction_dir.resolve()
+            prediction_dir = model.get("prediction_dir")
+            if prediction_dir:
+                prediction_dir = Path(prediction_dir)
+                if not prediction_dir.is_absolute():
+                    prediction_dir = REPO_ROOT / prediction_dir
+                model["prediction_dir"] = prediction_dir.resolve()
+            else:
+                model["prediction_dir"] = None
             for path_key in ("artifact_dir", "metrics_path"):
                 if model.get(path_key):
                     value = Path(model[path_key])
                     if not value.is_absolute():
                         value = REPO_ROOT / value
                     model[path_key] = value.resolve()
-            model["available"] = prediction_dir.is_dir() and any(prediction_dir.glob("*.txt"))
+            inference = dict(model.get("inference") or {})
+            config_path = inference.get("config")
+            if config_path:
+                config_path = Path(config_path)
+                if not config_path.is_absolute():
+                    config_path = REPO_ROOT / config_path
+                inference["config_path"] = config_path.resolve()
+            weights = []
+            seen_paths = set()
+            declared = list(inference.get("weights") or [])
+            for pattern in inference.get("checkpoint_globs") or []:
+                pattern_path = Path(pattern)
+                absolute_pattern = pattern if pattern_path.is_absolute() else str(REPO_ROOT / pattern)
+                declared.extend({"path": value} for value in sorted(glob.glob(absolute_pattern, recursive=True)))
+            for index, item in enumerate(declared):
+                item = {"path": item} if isinstance(item, str) else dict(item)
+                checkpoint = Path(item["path"])
+                if not checkpoint.is_absolute():
+                    checkpoint = REPO_ROOT / checkpoint
+                checkpoint = checkpoint.resolve()
+                if checkpoint in seen_paths or not checkpoint.is_file():
+                    continue
+                seen_paths.add(checkpoint)
+                identifier = item.get("id") or "w_" + hashlib.sha1(
+                    str(checkpoint).encode("utf-8")
+                ).hexdigest()[:10]
+                weights.append({
+                    "id": str(identifier),
+                    "label": str(item.get("label") or checkpoint.stem),
+                    "path": checkpoint,
+                    "relative_path": str(checkpoint.relative_to(REPO_ROOT))
+                        if REPO_ROOT in checkpoint.parents else str(checkpoint),
+                })
+            inference["weights"] = weights
+            model["inference"] = inference
+            has_predictions = bool(
+                prediction_dir and prediction_dir.is_dir()
+                and any(prediction_dir.glob("*.txt"))
+            )
+            model["precomputed_available"] = has_predictions
+            model["live_available"] = bool(weights)
+            model["available"] = has_predictions or bool(weights)
             models.append(model)
         return models
+
+    def model_by_id(self, model_id: str) -> Dict:
+        for model in self.models:
+            if model["id"] == model_id:
+                return model
+        raise KeyError("unknown model: " + model_id)
+
+    @staticmethod
+    def weight_by_id(model: Dict, weight_id: str) -> Dict:
+        for weight in (model.get("inference") or {}).get("weights", []):
+            if weight["id"] == weight_id:
+                return weight
+        raise KeyError("unknown weight {} for {}".format(weight_id, model["id"]))
 
     def _validation_reports(self) -> List[Dict]:
         reports = []
@@ -243,17 +314,29 @@ class DashboardData:
         return reports
 
     def public_config(self) -> Dict:
+        public_models = []
+        for model in self.models:
+            inference = model.get("inference") or {}
+            public_models.append({
+                "id": model["id"],
+                "label": model.get("label", model["id"]),
+                "color": model.get("color", "#ffffff"),
+                "available": model["available"],
+                "precomputed_available": model["precomputed_available"],
+                "live_available": model["live_available"],
+                "weights": [
+                    {key: weight[key] for key in ("id", "label", "relative_path")}
+                    for weight in inference.get("weights", [])
+                ],
+                "default_weight": inference.get("default_weight"),
+            })
         return {
             "split": self.split,
             "frames": self.frame_ids,
             "pseudo_labels_available": len(self.pseudo_records),
             "reprojection_metrics": self.reprojection_metrics,
             "validation_reports": self._validation_reports(),
-            "models": [
-                {key: value for key, value in model.items()
-                 if key not in ("prediction_dir", "artifact_dir", "metrics_path")}
-                for model in self.models
-            ],
+            "models": public_models,
         }
 
     def image_path(self, frame_id: str) -> Path:
@@ -282,8 +365,9 @@ class DashboardData:
         predictions = {}
         inference_artifacts = {}
         for model in self.models:
-            prediction_path = model["prediction_dir"] / f"{frame_id}.txt"
-            if prediction_path.is_file():
+            prediction_dir = model.get("prediction_dir")
+            prediction_path = prediction_dir / f"{frame_id}.txt" if prediction_dir else None
+            if prediction_path is not None and prediction_path.is_file():
                 predictions[model["id"]] = [
                     object_to_record(obj, object_id, calibration.P2, model["id"])
                     for object_id, obj in enumerate(get_objects_from_label(str(prediction_path)))
@@ -368,6 +452,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception as error:  # Keep local debugging errors visible to the UI.
             self.send_json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
+    def do_POST(self):  # noqa: N802
+        path = unquote(urlparse(self.path).path)
+        if path != "/api/infer":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 65536:
+                raise ValueError("invalid request body size")
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            result = self.server.inference.infer(
+                str(payload.get("frame_id", "")),
+                payload.get("selections") or [],
+                payload.get("threshold", 0.2),
+            )
+            self.send_json(result)
+        except (KeyError, ValueError) as error:
+            self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        except Exception as error:
+            self.send_json({"error": str(error)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
     def send_json(self, payload: Dict, status=HTTPStatus.OK):
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
@@ -394,11 +499,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def main() -> None:
     args = parse_args()
     data = DashboardData(args)
+    from dashboard.inference import DashboardInference
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     server.data = data
+    server.inference = DashboardInference(data, device=args.device, topk=args.topk)
     print(f"MonoDETR geometry dashboard: http://{args.host}:{args.port}")
     print(f"Split: {args.split} ({len(data.frame_ids)} frames)")
     print(f"Pseudo-labels: {len(data.pseudo_records)} loaded from {data.pseudo_path}")
+    live_count = sum(len((model.get("inference") or {}).get("weights", [])) for model in data.models)
+    print(f"Live checkpoints: {live_count} · device: {args.device}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -409,4 +518,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -15,6 +15,8 @@ const state = {
   hovered: null,
   matches: {},
   selectedModels: new Set(),
+  selectedWeights: new Map(),
+  liveInference: {},
   threshold: 0.2,
   toggles: { gt: true, pred: true, touch: true, reproject: false, horizon: true, arrows: true },
   bev: { centerX: 0, centerZ: 35, zoom: 1, dragging: false, moved: false, lastX: 0, lastY: 0, downX: 0, downY: 0 },
@@ -48,10 +50,66 @@ function visiblePredictions(modelId) {
   return (state.frame.predictions[modelId] || []).filter((item) => item.confidence >= state.threshold);
 }
 
-function distance2d(left, right) {
-  const dx = left.location_3d[0] - right.location_3d[0];
-  const dz = left.location_3d[2] - right.location_3d[2];
-  return Math.hypot(dx, dz);
+function boxIou2d(left, right) {
+  const a = left.bbox_2d, b = right.bbox_2d;
+  if (!a || !b) return 0;
+  const width = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
+  const height = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+  const intersection = width * height;
+  const areaA = Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1]);
+  const areaB = Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
+  return intersection / Math.max(1e-9, areaA + areaB - intersection);
+}
+
+function hungarianMinimum(cost) {
+  // Rectangular Hungarian assignment for rows <= columns. This variant is
+  // O(rows * columns^2), easily small enough for KITTI objects/top-50 boxes.
+  const rows = cost.length;
+  const columns = rows ? cost[0].length : 0;
+  const u = Array(rows + 1).fill(0), v = Array(columns + 1).fill(0);
+  const p = Array(columns + 1).fill(0), way = Array(columns + 1).fill(0);
+  for (let row = 1; row <= rows; row += 1) {
+    p[0] = row;
+    let column0 = 0;
+    const minValue = Array(columns + 1).fill(Infinity);
+    const used = Array(columns + 1).fill(false);
+    do {
+      used[column0] = true;
+      const row0 = p[column0];
+      let delta = Infinity, column1 = 0;
+      for (let column = 1; column <= columns; column += 1) {
+        if (used[column]) continue;
+        const current = cost[row0 - 1][column - 1] - u[row0] - v[column];
+        if (current < minValue[column]) {
+          minValue[column] = current;
+          way[column] = column0;
+        }
+        if (minValue[column] < delta) {
+          delta = minValue[column];
+          column1 = column;
+        }
+      }
+      for (let column = 0; column <= columns; column += 1) {
+        if (used[column]) {
+          u[p[column]] += delta;
+          v[column] -= delta;
+        } else {
+          minValue[column] -= delta;
+        }
+      }
+      column0 = column1;
+    } while (p[column0] !== 0);
+    do {
+      const column1 = way[column0];
+      p[column0] = p[column1];
+      column0 = column1;
+    } while (column0 !== 0);
+  }
+  const assignment = Array(rows).fill(-1);
+  for (let column = 1; column <= columns; column += 1) {
+    if (p[column] > 0) assignment[p[column] - 1] = column - 1;
+  }
+  return assignment;
 }
 
 function computeMatches() {
@@ -59,21 +117,23 @@ function computeMatches() {
   if (!state.frame) return;
   for (const model of state.config.models) {
     const predictions = visiblePredictions(model.id);
-    const pairs = [];
-    state.frame.ground_truth.forEach((gt) => predictions.forEach((pred) => {
-      if (canonicalClass(gt.class) !== canonicalClass(pred.class)) return;
-      const distance = distance2d(gt, pred);
-      if (distance <= 8) pairs.push({ gt, pred, distance });
-    }));
-    pairs.sort((left, right) => left.distance - right.distance);
-    const usedGt = new Set();
-    const usedPred = new Set();
+    const groundTruth = state.frame.ground_truth;
+    // One dummy column per GT lets the optimum leave an object unmatched.
+    const cost = groundTruth.map((gt) => [
+      ...predictions.map((pred) => {
+        if (canonicalClass(gt.class) !== canonicalClass(pred.class)) return 1.0;
+        const iou = boxIou2d(gt, pred);
+        return iou >= 0.5 ? 1.0 - iou : 1.0;
+      }),
+      ...Array(groundTruth.length).fill(0.75),
+    ]);
     const accepted = [];
-    for (const pair of pairs) {
-      if (usedGt.has(pair.gt.id) || usedPred.has(pair.pred.id)) continue;
-      usedGt.add(pair.gt.id);
-      usedPred.add(pair.pred.id);
-      accepted.push(pair);
+    for (const [gtIndex, predictionIndex] of hungarianMinimum(cost).entries()) {
+      if (predictionIndex < 0 || predictionIndex >= predictions.length) continue;
+      const gt = groundTruth[gtIndex], pred = predictions[predictionIndex];
+      if (canonicalClass(gt.class) !== canonicalClass(pred.class)) continue;
+      const iou = boxIou2d(gt, pred);
+      if (iou >= 0.5) accepted.push({ gt, pred, iou });
     }
     state.matches[model.id] = accepted;
   }
@@ -110,6 +170,19 @@ function drawBox2d(ctx, corners, transform, color, width, alpha = 1) {
   ctx.restore();
 }
 
+function drawCameraLabel(ctx, text, x, y, color, ratio) {
+  ctx.save();
+  ctx.font = `${9 * ratio}px ui-monospace, monospace`;
+  const padding = 3 * ratio;
+  const width = ctx.measureText(text).width + 2 * padding;
+  const height = 14 * ratio;
+  ctx.fillStyle = "rgba(4,9,13,.82)";
+  ctx.fillRect(x, y - height, width, height);
+  ctx.fillStyle = color;
+  ctx.fillText(text, x + padding, y - 4 * ratio);
+  ctx.restore();
+}
+
 function drawCamera() {
   const size = resizeCanvas(cameraCanvas);
   const ctx = cameraContext;
@@ -139,24 +212,25 @@ function drawCamera() {
   if (state.toggles.horizon) {
     for (const model of selectedModels()) {
       const horizon = state.frame.inference_artifacts?.[model.id]?.horizon;
-      const segment = horizon?.visible_segment_raw;
-      if (!segment) continue;
       const rawSegment = horizon?.raw_visible_segment_raw;
-      if (rawSegment && horizon?.vertical_edge_refinement?.valid) {
+      if (rawSegment) {
         const [rawLeft, rawRight] = rawSegment.map(map);
         ctx.save();
-        ctx.globalAlpha = 0.38;
+        ctx.globalAlpha = 0.72;
         ctx.strokeStyle = model.color; ctx.lineWidth = 1.2 * size.ratio;
         ctx.setLineDash([1 * size.ratio, 5 * size.ratio]);
         ctx.beginPath(); ctx.moveTo(...rawLeft); ctx.lineTo(...rawRight); ctx.stroke();
         ctx.restore();
       }
-      const [left, right] = segment.map(map);
-      ctx.save();
-      ctx.strokeStyle = model.color; ctx.lineWidth = 1.8 * size.ratio;
-      ctx.setLineDash([3 * size.ratio, 3 * size.ratio]);
-      ctx.beginPath(); ctx.moveTo(...left); ctx.lineTo(...right); ctx.stroke();
-      ctx.restore();
+      const segment = horizon?.visible_segment_raw;
+      if (segment && horizon?.vertical_edge_refinement?.valid) {
+        const [left, right] = segment.map(map);
+        ctx.save();
+        ctx.strokeStyle = model.color; ctx.lineWidth = 2.1 * size.ratio;
+        ctx.setLineDash([]);
+        ctx.beginPath(); ctx.moveTo(...left); ctx.lineTo(...right); ctx.stroke();
+        ctx.restore();
+      }
     }
   }
 
@@ -170,6 +244,14 @@ function drawCamera() {
     for (const pred of visiblePredictions(model.id)) {
       const highlighted = isHighlighted("pred", model.id, pred.id);
       drawBox2d(ctx, pred.corners_2d, map, model.color, (highlighted ? 4 : 1.8) * size.ratio, highlighted ? 1 : 0.88);
+      const pair = (state.matches[model.id] || []).find((item) => item.pred.id === pred.id);
+      const anchor = map([pred.bbox_2d[0], pred.bbox_2d[1]]);
+      const predictedZ = pred.location_3d?.[2];
+      const gtText = pair ? ` · Zgt ${pair.gt.location_3d[2].toFixed(2)}` : " · Zgt —";
+      drawCameraLabel(
+        ctx, `${model.label} · Zpred ${predictedZ.toFixed(2)}${gtText}`,
+        anchor[0], anchor[1] - 2 * size.ratio, model.color, size.ratio,
+      );
     }
   }
 
@@ -186,6 +268,22 @@ function drawCamera() {
         ctx.arc(x, y, (highlighted ? 6 : 4.5) * size.ratio, 0, Math.PI * 2);
         ctx.fill(); ctx.stroke();
       }
+      const near = object.near_contact;
+      if (near?.projection_valid && near.pixel_2d) {
+        const [x, y] = map(near.pixel_2d);
+        const highlighted = isHighlighted("gt", null, object.object_id);
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(Math.PI / 4);
+        ctx.fillStyle = "#ffffff";
+        ctx.strokeStyle = highlighted ? "#ff4fc3" : "#071018";
+        ctx.lineWidth = (highlighted ? 2.5 : 1.3) * size.ratio;
+        const radius = (highlighted ? 6 : 4.5) * size.ratio;
+        ctx.fillRect(-radius, -radius, 2 * radius, 2 * radius);
+        ctx.strokeRect(-radius, -radius, 2 * radius, 2 * radius);
+        ctx.restore();
+        drawCameraLabel(ctx, "near GT", x + 5 * size.ratio, y - 5 * size.ratio, "#ffffff", size.ratio);
+      }
     }
   }
   if (state.toggles.touch) {
@@ -200,13 +298,15 @@ function drawCamera() {
           ctx.strokeStyle = "#071018"; ctx.lineWidth = 1.2 * size.ratio;
           ctx.arc(x, y, 3.5 * size.ratio, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
         });
-        if (points.length && pred.e1?.selected_depth_m !== undefined) {
+        if (points.length && pred.e1?.selected_depth_m !== undefined && isHighlighted("pred", model.id, pred.id)) {
           const anchor = map(points[0]);
           const geo = pred.e1.geometry_valid ? ` · geo ${pred.e1.geometric_depth_m.toFixed(1)}m` : " · geo invalid";
-          ctx.fillStyle = model.color;
-          ctx.font = `${9 * size.ratio}px ui-monospace, monospace`;
-          ctx.fillText(`P1 ${pred.e1.pass1_depth_m.toFixed(1)}m · P2 ${pred.e1.selected_depth_m.toFixed(1)}m${geo}`,
-            anchor[0] + 5 * size.ratio, anchor[1] - 6 * size.ratio);
+          const touchText = points.length === 1 ? "near touch" : `${points.length} touches`;
+          drawCameraLabel(
+            ctx, `${touchText} · Zfinal ${pred.e1.selected_depth_m.toFixed(1)}m${geo}`,
+            anchor[0] + 5 * size.ratio, anchor[1] - 6 * size.ratio,
+            model.color, size.ratio,
+          );
         }
       }
     }
@@ -217,6 +317,14 @@ function drawCamera() {
 function formatMetric(value) {
   return value === null || value === undefined || !Number.isFinite(Number(value))
     ? "—" : Number(value).toFixed(3);
+}
+
+function lineFromSegment(segment) {
+  if (!segment || segment.length !== 2) return null;
+  const deltaX = segment[1][0] - segment[0][0];
+  if (Math.abs(deltaX) < 1e-9) return null;
+  const slope = (segment[1][1] - segment[0][1]) / deltaX;
+  return [slope, segment[0][1] - slope * segment[0][0]];
 }
 
 function renderValidationSummary() {
@@ -427,8 +535,17 @@ function drawBevTooltip(ctx, size) {
   const deltaX = pair.pred.location_3d[0] - pair.gt.location_3d[0];
   const deltaZ = pair.pred.location_3d[2] - pair.gt.location_3d[2];
   const model = state.config.models.find((item) => item.id === pair.modelId);
-  const lines = [model?.label || pair.modelId, `ΔX ${deltaX >= 0 ? "+" : ""}${deltaX.toFixed(2)} m`, `ΔZ ${deltaZ >= 0 ? "+" : ""}${deltaZ.toFixed(2)} m`];
-  const x = 14 * size.ratio, y = 14 * size.ratio, width = 142 * size.ratio, height = 66 * size.ratio;
+  const touch = pair.pred.e1?.touchpoints_raw?.[0];
+  const geometryDepth = pair.pred.e1?.geometric_depth_m;
+  const lines = [
+    model?.label || pair.modelId,
+    `Zpred ${pair.pred.location_3d[2].toFixed(2)} m · Zgt ${pair.gt.location_3d[2].toFixed(2)} m`,
+    `ΔX ${deltaX >= 0 ? "+" : ""}${deltaX.toFixed(2)} m · ΔZ ${deltaZ >= 0 ? "+" : ""}${deltaZ.toFixed(2)} m`,
+  ];
+  if (touch) lines.push(`touch (${touch[0].toFixed(1)}, ${touch[1].toFixed(1)}) px`);
+  if (Number.isFinite(geometryDepth)) lines.push(`Zgeo ${geometryDepth.toFixed(2)} m`);
+  const x = 14 * size.ratio, y = 14 * size.ratio, width = 256 * size.ratio;
+  const height = (16 + lines.length * 17) * size.ratio;
   ctx.save();
   ctx.fillStyle = "rgba(8, 15, 21, .92)"; ctx.strokeStyle = model?.color || "#fff"; ctx.lineWidth = size.ratio;
   ctx.beginPath(); ctx.roundRect(x, y, width, height, 6 * size.ratio); ctx.fill(); ctx.stroke();
@@ -437,7 +554,7 @@ function drawBevTooltip(ctx, size) {
   ctx.restore();
 }
 
-function drawAll() { drawCamera(); drawBev(); updateReadouts(); }
+function drawAll() { drawCamera(); drawBev(); updateReadouts(); updateInferenceReadout(); }
 
 function updateDatasetReprojectionMetrics() {
   const output = $("#dataset-reprojection-mae");
@@ -485,6 +602,44 @@ function updateReadouts() {
   } else {
     $("#bev-readout").textContent = "Drag to pan · Wheel to zoom";
   }
+}
+
+function updateInferenceReadout() {
+  const output = $("#model-inference-readout");
+  if (!state.config || !state.frame) return;
+  const lines = [];
+  const gtHorizon = state.frame.pseudo_labels?.horizon_line;
+  if (gtHorizon?.valid) {
+    lines.push(`Hgt(raw) k=${Number(gtHorizon.slope).toFixed(4)} b=${Number(gtHorizon.intercept).toFixed(1)}`);
+  } else {
+    lines.push("Hgt(raw) unavailable");
+  }
+  for (const model of selectedModels()) {
+    const live = state.liveInference[model.id];
+    const artifact = state.frame.inference_artifacts?.[model.id];
+    const horizon = artifact?.horizon;
+    const selectedWeight = state.selectedWeights.get(model.id);
+    const weight = model.weights?.find((item) => item.id === selectedWeight);
+    const source = live
+      ? `${live.weight_label}${live.checkpoint_epoch === null || live.checkpoint_epoch === undefined ? "" : ` · ep ${live.checkpoint_epoch}`} · ${live.latency_ms.toFixed(0)} ms`
+      : (artifact
+        ? `precomputed output${weight ? ` · ${weight.label} not run` : ""}`
+        : (weight ? `${weight.label} · not run` : "no output"));
+    lines.push(`${model.label} · ${source}`);
+    const raw = lineFromSegment(horizon?.raw_visible_segment_raw);
+    const refined = lineFromSegment(horizon?.visible_segment_raw) || raw;
+    if (raw) {
+      const edge = horizon.vertical_edge_refinement || {};
+      lines.push(
+        `  Hraw(raw) k=${raw[0].toFixed(4)} b=${raw[1].toFixed(1)} · ` +
+        `Href(raw) k=${refined[0].toFixed(4)} b=${refined[1].toFixed(1)} · ` +
+        (edge.valid ? `edge ${edge.edge_count}` : "edge invalid"),
+      );
+    } else {
+      lines.push("  horizon unavailable");
+    }
+  }
+  output.textContent = lines.length ? lines.join("\n") : "Select a model/checkpoint, then press Run.";
 }
 
 function candidateAtCamera(event) {
@@ -536,6 +691,7 @@ async function loadFrame(index) {
     if (serial !== loadSerial) return;
     state.frame = payload;
     state.image = image;
+    state.liveInference = {};
     state.selected = null;
     state.hovered = null;
     computeMatches();
@@ -551,6 +707,58 @@ async function loadFrame(index) {
   }
 }
 
+async function runInference() {
+  if (!state.frame) return;
+  const selections = selectedModels()
+    .filter((model) => model.live_available && state.selectedWeights.get(model.id))
+    .map((model) => ({
+      model_id: model.id,
+      weight_id: state.selectedWeights.get(model.id),
+    }));
+  if (!selections.length) {
+    $("#status").textContent = "Select at least one model with an available checkpoint.";
+    return;
+  }
+
+  const button = $("#run-inference");
+  button.disabled = true;
+  button.textContent = "Running…";
+  $("#status").textContent = `Running ${selections.length} checkpoint${selections.length === 1 ? "" : "s"} on ${state.frame.frame_id}…`;
+  try {
+    const response = await fetch("/api/infer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        frame_id: state.frame.frame_id,
+        // Fetch all top-k detections once. The confidence slider then filters
+        // them locally without another forward pass.
+        threshold: 0,
+        selections,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    if (payload.frame_id !== state.frame.frame_id) return;
+    for (const [modelId, result] of Object.entries(payload.models || {})) {
+      state.frame.predictions[modelId] = result.predictions || [];
+      state.frame.inference_artifacts[modelId] = result.artifact || null;
+      state.liveInference[modelId] = result;
+    }
+    computeMatches();
+    drawAll();
+    const completed = Object.keys(payload.models || {}).length;
+    const errors = Object.entries(payload.errors || {});
+    $("#status").textContent = errors.length
+      ? `Inference complete: ${completed} succeeded, ${errors.length} failed · ${errors.map(([id, error]) => `${id}: ${error}`).join(" | ")}`
+      : `Inference complete · ${completed} checkpoint${completed === 1 ? "" : "s"} · ${state.frame.frame_id}`;
+  } catch (error) {
+    $("#status").textContent = `Inference error: ${error.message}`;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Run";
+  }
+}
+
 function initialiseControls() {
   const frameSelect = $("#frame-select");
   for (const frameId of state.config.frames) frameSelect.add(new Option(frameId, frameId));
@@ -559,22 +767,49 @@ function initialiseControls() {
   $("#next-frame").addEventListener("click", () => loadFrame(state.frameIndex + 1));
 
   const options = $("#model-options");
-  for (const model of state.config.models) {
-    const label = document.createElement("label");
+  const baselineAvailable = state.config.models.some((model) => model.id === "monodetr" && model.available);
+  const firstAvailable = state.config.models.findIndex((model) => model.available);
+  state.config.models.forEach((model, modelIndex) => {
+    const row = document.createElement("div"); row.className = "model-option";
     const checkbox = document.createElement("input");
-    checkbox.type = "checkbox"; checkbox.checked = model.available; checkbox.disabled = !model.available;
-    if (model.available) state.selectedModels.add(model.id);
+    checkbox.type = "checkbox";
+    checkbox.id = `model-${model.id}`;
+    checkbox.disabled = !model.available;
+    checkbox.checked = model.available && (
+      model.id === "monodetr" || (!baselineAvailable && modelIndex === firstAvailable)
+    );
+    if (checkbox.checked) state.selectedModels.add(model.id);
     checkbox.addEventListener("change", () => {
       checkbox.checked ? state.selectedModels.add(model.id) : state.selectedModels.delete(model.id);
       $("#model-count").textContent = state.selectedModels.size;
       computeMatches(); drawAll();
     });
     const dot = document.createElement("span"); dot.className = "model-dot"; dot.style.background = model.color;
-    const text = document.createElement("span"); text.textContent = model.available ? model.label : `${model.label} (no files)`;
+    const text = document.createElement("label");
+    text.htmlFor = checkbox.id;
+    text.textContent = model.available ? model.label : `${model.label} (no output/checkpoint)`;
     if (!model.available) text.className = "unavailable";
-    label.append(checkbox, dot, text); options.append(label);
-  }
+    const weightSelect = document.createElement("select");
+    weightSelect.setAttribute("aria-label", `${model.label} checkpoint`);
+    if (model.weights?.length) {
+      for (const weight of model.weights) weightSelect.add(new Option(weight.label, weight.id));
+      const preferred = model.weights.some((weight) => weight.id === model.default_weight)
+        ? model.default_weight : model.weights[0].id;
+      weightSelect.value = preferred;
+      state.selectedWeights.set(model.id, preferred);
+      weightSelect.addEventListener("change", () => {
+        state.selectedWeights.set(model.id, weightSelect.value);
+        delete state.liveInference[model.id];
+        updateInferenceReadout();
+      });
+    } else {
+      weightSelect.add(new Option(model.precomputed_available ? "precomputed only" : "no checkpoint", ""));
+      weightSelect.disabled = true;
+    }
+    row.append(checkbox, dot, text, weightSelect); options.append(row);
+  });
   $("#model-count").textContent = state.selectedModels.size;
+  $("#run-inference").addEventListener("click", runInference);
   $("#validation-distance").addEventListener("change", renderValidationSummary);
   renderValidationSummary();
 

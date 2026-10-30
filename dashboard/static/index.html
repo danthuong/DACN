@@ -20,9 +20,10 @@
         <label>Frame <select id="frame-select" aria-label="Frame ID"></select></label>
         <button id="next-frame" type="button" title="Next frame">→</button>
         <details class="model-picker">
-          <summary>Models <span id="model-count">0</span></summary>
+          <summary>Models &amp; weights <span id="model-count">0</span></summary>
           <div id="model-options"></div>
         </details>
+        <button id="run-inference" class="run-inference" type="button" title="Run selected checkpoints on this frame">Run</button>
         <details class="model-picker validation-picker">
           <summary>Validation</summary>
           <div id="validation-summary">
@@ -41,10 +42,10 @@
         </label>
         <label><input id="toggle-gt" type="checkbox" checked /> GT boxes</label>
         <label><input id="toggle-pred" type="checkbox" checked /> Predictions</label>
-        <label><input id="toggle-touch" type="checkbox" checked /> Touch points</label>
+        <label><input id="toggle-touch" type="checkbox" checked /> GT/pred touchpoint</label>
         <label><input id="toggle-reproject" type="checkbox" /> Reproject touch points</label>
         <output id="dataset-reprojection-mae" class="metric-chip">Dataset |ΔZ| MAE —</output>
-        <label><input id="toggle-horizon" type="checkbox" checked /> Horizon</label>
+        <label><input id="toggle-horizon" type="checkbox" checked /> Horizon GT/raw/refined</label>
         <label><input id="toggle-arrows" type="checkbox" checked /> Depth shift</label>
       </div>
     </header>
@@ -55,7 +56,17 @@
           <h2>Camera image</h2>
           <span id="camera-readout">—</span>
         </div>
-        <div class="canvas-wrap"><canvas id="camera-canvas"></canvas></div>
+        <div class="canvas-wrap">
+          <canvas id="camera-canvas"></canvas>
+          <div id="overlay-legend" class="overlay-legend">
+            <span><i class="legend-line gt-horizon"></i>Horizon GT</span>
+            <span><i class="legend-line raw-horizon"></i>Predicted raw</span>
+            <span><i class="legend-line refined-horizon"></i>Vertical-edge refined</span>
+            <span><i class="legend-point gt-touch"></i>Touchpoint GT</span>
+            <span><i class="legend-point pred-touch"></i>Touchpoint predicted</span>
+          </div>
+          <div id="model-inference-readout" class="model-inference-readout">Select checkpoints, then press Run.</div>
+        </div>
       </section>
 
       <section class="viewer bev-view" aria-label="BEV depth shift viewer">

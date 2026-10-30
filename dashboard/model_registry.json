@@ -5,7 +5,17 @@
       "label": "Baseline MonoDETR",
       "color": "#ff9f43",
       "format": "kitti",
-      "prediction_dir": "outputs/monodetr/outputs/data"
+      "prediction_dir": "outputs/monodetr/outputs/data",
+      "inference": {
+        "builder": "monodetr",
+        "config": "configs/monodetr.yaml",
+        "default_weight": "best",
+        "weights": [
+          {"id": "best", "label": "baseline best", "path": "outputs/monodetr/checkpoint_best_1.pth"},
+          {"id": "best_alt", "label": "baseline best (alt)", "path": "outputs/monodetr/checkpoint_best.pth"}
+        ],
+        "checkpoint_globs": ["outputs/monodetr/checkpoint*.pth"]
+      }
     },
     {
       "id": "e1_feature",
@@ -14,7 +24,17 @@
       "format": "kitti",
       "prediction_dir": "outputs/e1_feature_level/monodetr/outputs/pass2/data",
       "artifact_dir": "outputs/e1_feature_level/monodetr/outputs/pass2/artifacts",
-      "metrics_path": "outputs/e1_feature_level/validation/val_metrics.json"
+      "metrics_path": "outputs/e1_feature_level/validation/val_metrics.json",
+      "inference": {
+        "builder": "e1",
+        "config": "configs/e1_feature_level_touch_v2.yaml",
+        "default_weight": "best",
+        "weights": [
+          {"id": "best", "label": "feature best", "path": "outputs/e1_feature_level/monodetr/checkpoint_best.pth"},
+          {"id": "last", "label": "feature last", "path": "outputs/e1_feature_level/monodetr/checkpoint_last.pth"}
+        ],
+        "checkpoint_globs": ["outputs/e1_feature_level/**/checkpoint*.pth"]
+      }
     },
     {
       "id": "e1_distribution",
@@ -23,7 +43,36 @@
       "format": "kitti",
       "prediction_dir": "outputs/e1_distribution_level/monodetr/outputs/pass2/data",
       "artifact_dir": "outputs/e1_distribution_level/monodetr/outputs/pass2/artifacts",
-      "metrics_path": "outputs/e1_distribution_level/validation/val_metrics.json"
+      "metrics_path": "outputs/e1_distribution_level/validation/val_metrics.json",
+      "inference": {
+        "builder": "e1",
+        "config": "configs/e1_distribution_level_touch_v2.yaml",
+        "default_weight": "best",
+        "weights": [
+          {"id": "best", "label": "distribution best", "path": "outputs/e1_distribution_level/monodetr/checkpoint_best.pth"},
+          {"id": "last", "label": "distribution last", "path": "outputs/e1_distribution_level/monodetr/checkpoint_last.pth"}
+        ],
+        "checkpoint_globs": ["outputs/e1_distribution_level/**/checkpoint*.pth"]
+      }
+    },
+    {
+      "id": "near_gpro",
+      "label": "Near-GPro Z-map",
+      "color": "#ff6685",
+      "format": "kitti",
+      "prediction_dir": "outputs/near_gpro_zmap_scratch/near_gpro_zmap_replace_scratch/outputs/data",
+      "artifact_dir": "outputs/near_gpro_zmap_scratch/near_gpro_zmap_replace_scratch/outputs/artifacts",
+      "metrics_path": "outputs/near_gpro_zmap_scratch/near_gpro_zmap_replace_scratch/depth_report/near_gpro_depth_report.json",
+      "inference": {
+        "builder": "near_gpro",
+        "config": "configs/near_gpro_zmap_replace_scratch.yaml",
+        "default_weight": "best",
+        "weights": [
+          {"id": "best", "label": "near-GPro best AP", "path": "outputs/near_gpro_zmap_scratch/near_gpro_zmap_replace_scratch/checkpoint_best.pth"},
+          {"id": "last", "label": "near-GPro last", "path": "outputs/near_gpro_zmap_scratch/near_gpro_zmap_replace_scratch/checkpoint_last.pth"}
+        ],
+        "checkpoint_globs": ["outputs/near_gpro_zmap_scratch/**/checkpoint*.pth"]
+      }
     }
   ]
 }
