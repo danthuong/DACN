@@ -1,0 +1,132 @@
+extends: monodetr.yaml
+
+# New ablation: one decoder, original dense depth memory, post-decoder GPro
+# centre depth, and replacement of only the scalar Z-map term.
+random_seed: 444
+model_name: near_gpro_zmap_replace_scratch
+
+dataset:
+  batch_size: 8
+  meanshape: false
+  # Geometry labels and the projection matrix must stay in the same frame.
+  # Photometric augmentation is safe; crop/flip are disabled for the first run.
+  aug_pd: true
+  aug_crop: false
+  random_crop: 0.0
+  random_flip: 0.0
+  depth_scale: none
+
+near_gpro:
+  pseudo_labels:
+    root: "${NEAR_GPRO_PSEUDOLABEL_ROOT:-outputs/near_gpro_pseudo_labels}"
+    alignment: image_id_and_gt_object_id
+
+  horizon:
+    fpn_channels: 128
+    heatmap_stride: 4
+    gaussian_sigma_heatmap_px: 1.5
+    softargmax_temperature: 0.25
+    entropy_confidence: true
+    # Hard OpenCV refinement is eval-only. Training always uses the learned line.
+    vertical_edge_refinement:
+      enabled: true
+      gaussian_kernel_size: 13
+      gaussian_sigma: 4.0
+      canny_thresholds: [50, 100]
+      hough_threshold: 5
+      min_line_length_px: 40.0
+      max_line_gap_px: 10.0
+      vertical_angle_range_deg: [70.0, 110.0]
+      cluster_tolerance_deg: 3.0
+      min_edge_count: 5
+      max_angle_std_deg: 3.0
+
+  near_touchpoint:
+    class_index: 1                 # KITTI Car
+    definition: midpoint_of_two_smallest_camera_z_footprint_candidates
+    target_coordinate_mode: box_relative
+    roi_size: 9
+    roi_channels: 64
+    query_chunk_size: 50
+    softargmax_temperature: 0.25
+    offset_range: [-0.20, 1.20]
+    require_inside_image: true
+    box_detach: true
+    visual_feature_detach: false
+
+  plane:
+    camera_height_m: "${CAMERA_HEIGHT_M:-1.65}"
+    height_definition: normal_distance
+    min_abs_ray_plane_dot: 0.015
+    valid_min_depth_m: 2.0
+    valid_max_depth_m: 65.0
+
+  center_correction:
+    # Must equal the label generator values.
+    k_l: 0.65
+    k_w: 0.85
+    # Main MonoDETR losses still train size/yaw; initially keep noisy GPro
+    # gradients from rewriting them through the correction equation.
+    detach_dimensions_yaw: true
+
+  replacement:
+    formula: "(Z_query_reg + Z_size + valid_or_fallback(Z_gpro_center, Z_map)) / 3"
+    min_geometry_confidence: 0.0
+    invalid_policy: original_z_map
+
+  losses:
+    horizon_heatmap_loss_coef: 1.0
+    horizon_line_loss_coef: 0.5
+    near_touchpoint_loss_coef: 1.0
+    near_touchpoint_smooth_l1_beta: 0.05
+    gpro_center_depth_loss_coef: 1.0
+    gpro_log_depth_smooth_l1_beta: 0.05
+
+optimizer:
+  type: adamw
+  lr: 0.0002
+  weight_decay: 0.0001
+  param_groups:
+    original_monodetr_lr: 0.0002
+    horizon_touchpoint_lr: 0.0002
+    geometry_fusion_lr: 0.0001
+  grad_clip_norm: 0.1
+
+lr_scheduler:
+  type: step
+  warmup: true
+  decay_rate: 0.1
+  decay_list: [125, 165]
+
+trainer:
+  # Detector/transformer/depth heads start from scratch; the ResNet constructor
+  # keeps its normal ImageNet initialization, matching the prior scratch run.
+  pretrain_model: null
+  resume_model: null
+  max_epoch: 195
+  grad_accum_steps: 2
+  save_frequency: 1
+  save_path: outputs/near_gpro_zmap_scratch/
+  save_all: false
+  save_last_and_best: true
+  gpu_ids: "0"
+
+tester:
+  mode: single
+  checkpoint: 195
+  threshold: 0.2
+  topk: 50
+  output_variant: final
+
+runtime:
+  num_workers: 4
+
+logging:
+  log_every_n_steps: 20
+  gradient_norms_every_n_steps: 100
+  wandb:
+    enabled: true
+    mode: "${WANDB_MODE:-offline}"
+    project: monodetr-gpro3d-e1
+    run_name: near_gpro_zmap_replace_scratch_seed444
+    tags: [monodetr, gpro3d, near_center, box_relative, zmap_replacement, scratch]
