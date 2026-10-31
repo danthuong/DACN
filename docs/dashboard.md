@@ -37,6 +37,14 @@ The camera overlay uses:
 - model-coloured dot: predicted near touchpoint (or the four E1 touchpoints);
 - each predicted box label: `Zpred` and the 2D-IoU-matched `Zgt`.
 
+The overlays have separate controls: **Corner touchpoints** shows the original
+footprint points, **Near touch 2D** shows only the GT and predicted near-contact
+point on the camera image, and **Near touch → 3D** draws the model's own
+ray/ground-plane intersection as a diamond in BEV. Selecting its prediction
+also shows the camera-frame `(X, Y, Z)` coordinates. This 3D point comes from
+`geometry["near_point_camera"]`; it is not reconstructed from the pseudo-label
+ground plane in the browser.
+
 Click a matched box to show `Zpred`, `Zgt`, `delta Z`, predicted touchpoint
 pixel coordinates, and `Zgeo` in the BEV tooltip. Matching is class-constrained,
 one-to-one Hungarian assignment on raw-image 2D IoU >= 0.5; it does not use

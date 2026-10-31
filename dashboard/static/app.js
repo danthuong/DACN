@@ -18,7 +18,7 @@ const state = {
   selectedWeights: new Map(),
   liveInference: {},
   threshold: 0.2,
-  toggles: { gt: true, pred: true, touch: true, reproject: false, horizon: true, arrows: true },
+  toggles: { gt: true, pred: true, touch: true, near2d: true, reproject: false, near3d: false, horizon: true, arrows: true },
   bev: { centerX: 0, centerZ: 35, zoom: 1, dragging: false, moved: false, lastX: 0, lastY: 0, downX: 0, downY: 0 },
 };
 
@@ -255,21 +255,23 @@ function drawCamera() {
     }
   }
 
-  if (state.toggles.touch && state.frame.pseudo_labels) {
+  if ((state.toggles.touch || state.toggles.near2d) && state.frame.pseudo_labels) {
     for (const object of state.frame.pseudo_labels.objects || []) {
-      for (const point of object.touch_points || []) {
-        if (!point.projection_valid || !point.pixel_2d) continue;
-        const [x, y] = map(point.pixel_2d);
-        const highlighted = isHighlighted("gt", null, object.object_id);
-        ctx.beginPath();
-        ctx.fillStyle = TOUCH_COLORS[point.name] || "#fff";
-        ctx.strokeStyle = highlighted ? "white" : "#081017";
-        ctx.lineWidth = (highlighted ? 3 : 1.5) * size.ratio;
-        ctx.arc(x, y, (highlighted ? 6 : 4.5) * size.ratio, 0, Math.PI * 2);
-        ctx.fill(); ctx.stroke();
+      if (state.toggles.touch) {
+        for (const point of object.touch_points || []) {
+          if (!point.projection_valid || !point.pixel_2d) continue;
+          const [x, y] = map(point.pixel_2d);
+          const highlighted = isHighlighted("gt", null, object.object_id);
+          ctx.beginPath();
+          ctx.fillStyle = TOUCH_COLORS[point.name] || "#fff";
+          ctx.strokeStyle = highlighted ? "white" : "#081017";
+          ctx.lineWidth = (highlighted ? 3 : 1.5) * size.ratio;
+          ctx.arc(x, y, (highlighted ? 6 : 4.5) * size.ratio, 0, Math.PI * 2);
+          ctx.fill(); ctx.stroke();
+        }
       }
       const near = object.near_contact;
-      if (near?.projection_valid && near.pixel_2d) {
+      if (state.toggles.near2d && near?.projection_valid && near.pixel_2d) {
         const [x, y] = map(near.pixel_2d);
         const highlighted = isHighlighted("gt", null, object.object_id);
         ctx.save();
@@ -286,11 +288,13 @@ function drawCamera() {
       }
     }
   }
-  if (state.toggles.touch) {
+  if (state.toggles.touch || state.toggles.near2d) {
     for (const model of selectedModels()) {
       for (const pred of visiblePredictions(model.id)) {
         const points = pred.e1?.touchpoints_raw || [];
         const valid = pred.e1?.touchpoint_ray_valid || [];
+        const isNearContact = points.length === 1;
+        if ((isNearContact && !state.toggles.near2d) || (!isNearContact && !state.toggles.touch)) continue;
         points.forEach((point, index) => {
           const [x, y] = map(point);
           ctx.beginPath();
@@ -462,6 +466,60 @@ function drawReprojectedTouchPoints(ctx) {
   }
 }
 
+function validCameraPoint(point) {
+  return Array.isArray(point) && point.length === 3 && point.every((value) => Number.isFinite(Number(value)));
+}
+
+function drawPredictedNearTouchpoints3d(ctx) {
+  for (const model of selectedModels()) {
+    for (const pred of visiblePredictions(model.id)) {
+      const e1 = pred.e1 || {};
+      const near = e1.near_touchpoint_3d_camera;
+      const rayValid = e1.touchpoint_ray_valid?.[0] ?? e1.geometry_valid;
+      if (!rayValid || !validCameraPoint(near)) continue;
+
+      const position = bevTransform.worldToCanvas([Number(near[0]), Number(near[2])]);
+      const highlighted = isHighlighted("pred", model.id, pred.id);
+
+      if (validCameraPoint(pred.location_3d)) {
+        const center = bevTransform.worldToCanvas([
+          Number(pred.location_3d[0]), Number(pred.location_3d[2]),
+        ]);
+        ctx.save();
+        ctx.strokeStyle = model.color;
+        ctx.globalAlpha = highlighted ? 0.9 : 0.42;
+        ctx.lineWidth = (highlighted ? 2 : 1) * bevTransform.ratio;
+        ctx.setLineDash([4 * bevTransform.ratio, 4 * bevTransform.ratio]);
+        ctx.beginPath(); ctx.moveTo(...center); ctx.lineTo(...position); ctx.stroke();
+        ctx.restore();
+      }
+
+      const radius = (highlighted ? 6 : 4.5) * bevTransform.ratio;
+      ctx.save();
+      ctx.translate(position[0], position[1]);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = model.color;
+      ctx.strokeStyle = highlighted ? "#ffffff" : "#071018";
+      ctx.lineWidth = (highlighted ? 2.4 : 1.3) * bevTransform.ratio;
+      ctx.fillRect(-radius, -radius, 2 * radius, 2 * radius);
+      ctx.strokeRect(-radius, -radius, 2 * radius, 2 * radius);
+      ctx.restore();
+
+      if (highlighted) {
+        ctx.save();
+        ctx.fillStyle = "#e8f4fa";
+        ctx.font = `${10 * bevTransform.ratio}px ui-monospace, monospace`;
+        ctx.fillText(
+          `near3D (${near.map((value) => Number(value).toFixed(2)).join(", ")})m`,
+          position[0] + 8 * bevTransform.ratio,
+          position[1] - 8 * bevTransform.ratio,
+        );
+        ctx.restore();
+      }
+    }
+  }
+}
+
 function drawBev() {
   const size = resizeCanvas(bevCanvas);
   const ctx = bevContext;
@@ -503,6 +561,7 @@ function drawBev() {
       }
     }
     if (state.toggles.reproject) drawReprojectedTouchPoints(ctx);
+    if (state.toggles.near3d) drawPredictedNearTouchpoints3d(ctx);
   }
 
   ctx.save();
@@ -537,12 +596,16 @@ function drawBevTooltip(ctx, size) {
   const model = state.config.models.find((item) => item.id === pair.modelId);
   const touch = pair.pred.e1?.touchpoints_raw?.[0];
   const geometryDepth = pair.pred.e1?.geometric_depth_m;
+  const near3d = pair.pred.e1?.near_touchpoint_3d_camera;
   const lines = [
     model?.label || pair.modelId,
     `Zpred ${pair.pred.location_3d[2].toFixed(2)} m · Zgt ${pair.gt.location_3d[2].toFixed(2)} m`,
     `ΔX ${deltaX >= 0 ? "+" : ""}${deltaX.toFixed(2)} m · ΔZ ${deltaZ >= 0 ? "+" : ""}${deltaZ.toFixed(2)} m`,
   ];
   if (touch) lines.push(`touch (${touch[0].toFixed(1)}, ${touch[1].toFixed(1)}) px`);
+  if (validCameraPoint(near3d)) {
+    lines.push(`near3D (${near3d.map((value) => Number(value).toFixed(2)).join(", ")}) m`);
+  }
   if (Number.isFinite(geometryDepth)) lines.push(`Zgeo ${geometryDepth.toFixed(2)} m`);
   const x = 14 * size.ratio, y = 14 * size.ratio, width = 256 * size.ratio;
   const height = (16 + lines.length * 17) * size.ratio;
@@ -818,7 +881,7 @@ function initialiseControls() {
     $("#confidence-value").value = state.threshold.toFixed(2);
     computeMatches(); drawAll();
   });
-  for (const [id, key] of [["#toggle-gt","gt"],["#toggle-pred","pred"],["#toggle-touch","touch"],["#toggle-reproject","reproject"],["#toggle-horizon","horizon"],["#toggle-arrows","arrows"]]) {
+  for (const [id, key] of [["#toggle-gt","gt"],["#toggle-pred","pred"],["#toggle-touch","touch"],["#toggle-near-2d","near2d"],["#toggle-reproject","reproject"],["#toggle-near-3d","near3d"],["#toggle-horizon","horizon"],["#toggle-arrows","arrows"]]) {
     $(id).addEventListener("change", (event) => { state.toggles[key] = event.target.checked; computeMatches(); drawAll(); });
   }
 }

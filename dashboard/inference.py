@@ -202,6 +202,10 @@ class DashboardInference:
             }
 
         geometry = outputs.get("geometry") or {}
+        if geometry and geometry.get("plane") is not None:
+            artifact["geometry_plane_camera"] = (
+                geometry["plane"][0].detach().float().cpu().tolist()
+            )
         for detection_id, (query, class_id, class_score) in enumerate(ranked_queries):
             record = {
                 "detection_id": detection_id,
@@ -230,6 +234,21 @@ class DashboardInference:
                     "geometric_depth_m": float(geometry["object_depth"][0, query]),
                     "geometry_valid": bool(geometry["object_valid"][0, query]),
                 })
+                intersections = geometry.get("touchpoint_intersections")
+                if intersections is not None:
+                    record["touchpoints_3d_camera"] = (
+                        intersections[0, query].detach().float().cpu().tolist()
+                    )
+                near_point = geometry.get("near_point_camera")
+                if near_point is not None:
+                    record["near_touchpoint_3d_camera"] = (
+                        near_point[0, query].detach().float().cpu().tolist()
+                    )
+                bottom_center = geometry.get("bottom_center_camera")
+                if bottom_center is not None:
+                    record["bottom_center_3d_camera"] = (
+                        bottom_center[0, query].detach().float().cpu().tolist()
+                    )
             artifact["detections"].append(record)
         return artifact
 
