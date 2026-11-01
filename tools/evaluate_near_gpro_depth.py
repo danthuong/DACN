@@ -51,6 +51,10 @@ def parse_args():
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--allow-missing-artifacts", action="store_true")
     parser.add_argument("--skip-official-ap", action="store_true")
+    parser.add_argument(
+        "--final-formula", choices=("current", "direct"), default="current",
+        help="Formula used by selected_depth_m; controls the invariant check.",
+    )
     return parser.parse_args()
 
 
@@ -117,6 +121,9 @@ def evaluate(args):
     targets = {name: [] for name, _, _ in BRANCHES}
     rows, missing = [], []
     detector_matched = total_gt = 0
+    final_formula = getattr(args, "final_formula", "current")
+    if final_formula not in ("current", "direct"):
+        raise ValueError("final_formula must be current or direct")
     baseline_residuals, final_residuals, near_errors = [], [], []
     paired = []
 
@@ -149,15 +156,30 @@ def evaluate(args):
                     predictions[name].append(value)
                     targets[name].append(target["depth"])
 
-            required = ("final", "baseline_original_formula", "query_reg",
-                        "size_geometry", "zmap_original", "selected_cue")
-            if all(values[name] is not None for name in required):
+            baseline_required = ("baseline_original_formula", "query_reg",
+                                 "size_geometry", "zmap_original")
+            if all(values[name] is not None for name in baseline_required):
                 baseline_residuals.append(values["baseline_original_formula"] - (
                     values["query_reg"] + values["size_geometry"] + values["zmap_original"]
                 ) / 3.0)
-                final_residuals.append(values["final"] - (
-                    values["query_reg"] + values["size_geometry"] + values["selected_cue"]
-                ) / 3.0)
+            if final_formula == "current":
+                current_required = (
+                    "final", "query_reg", "size_geometry", "selected_cue")
+                if all(values[name] is not None for name in current_required):
+                    final_residuals.append(values["final"] - (
+                        values["query_reg"] + values["size_geometry"]
+                        + values["selected_cue"]
+                    ) / 3.0)
+            elif (values["final"] is not None
+                  and values["baseline_original_formula"] is not None):
+                use_gpro = bool(
+                    detection is not None
+                    and detection.get("replacement_valid", False)
+                    and values["gpro_center"] is not None)
+                expected_depth = (
+                    values["gpro_center"] if use_gpro
+                    else values["baseline_original_formula"])
+                final_residuals.append(values["final"] - expected_depth)
             if values["gpro_center"] is not None and values["zmap_original"] is not None:
                 paired.append({
                     "gpro_ae": abs(values["gpro_center"] - target["depth"]),
@@ -230,6 +252,7 @@ def evaluate(args):
                 if baseline_residuals else None,
             "final_max_abs_residual_m": float(np.max(np.abs(final_residuals)))
                 if final_residuals else None,
+            "final_formula": final_formula,
             "expected": "both residuals should be near floating-point zero",
         },
     }
@@ -295,7 +318,8 @@ def evaluate(args):
     (output_dir / "near_gpro_depth_report.md").write_text(
         "\n".join(lines), encoding="utf-8"
     )
-    print(json.dumps(report, indent=2))
+    if not getattr(args, "quiet", False):
+        print(json.dumps(report, indent=2))
     return report
 
 

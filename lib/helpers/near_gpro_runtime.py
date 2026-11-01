@@ -78,9 +78,17 @@ class NearGProTester(Tester):
                         ][batch_index, query_index].detach().float()),
                     })
             payload["schema_version"] = "near-gpro-zmap-inference-v1"
-            payload["depth_formula"] = (
-                "Zfinal=(Zquery+Zsize+where(valid,Zgpro_center,Zmap))/3"
-            )
+            depth_variant = selected_outputs.get(
+                "_depth_output_variant", "current")
+            payload["depth_output_variant"] = depth_variant
+            if depth_variant == "direct":
+                payload["depth_formula"] = (
+                    "Zfinal=where(valid,Zgpro_center,Zbaseline_original)"
+                )
+            else:
+                payload["depth_formula"] = (
+                    "Zfinal=(Zquery+Zsize+where(valid,Zgpro_center,Zmap))/3"
+                )
             path.write_text(
                 json.dumps(payload, separators=(",", ":")) + "\n",
                 encoding="utf-8",

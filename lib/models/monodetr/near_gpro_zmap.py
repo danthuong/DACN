@@ -484,14 +484,24 @@ class NearGProMonoDETR(MonoDETR):
         z_map = out["pred_depth_predictor_sample"]
         z_cue = torch.where(valid, geometry["object_depth"], z_map)
         z_baseline = out["pred_depth"][..., 0]
-        z_final = (
+        z_current = (
             out["pred_depth_query_reg"] + out["pred_depth_size"] + z_cue
         ) / 3.0
+        # Paired inference ablation: trust the post-decoder GPro centre depth
+        # completely when it is valid, otherwise preserve the original
+        # MonoDETR three-cue estimate. Both tensors are exported so a tester
+        # can decode current/direct results from the exact same forward pass.
+        z_direct = torch.where(valid, geometry["object_depth"], z_baseline)
+        depth_uncertainty = out["pred_depth"][..., 1]
         out["pred_depth_baseline"] = z_baseline
         out["pred_depth_cue"] = z_cue
-        out["pred_depth"] = torch.stack(
-            (z_final, out["pred_depth"][..., 1]), dim=-1
-        )
+        out["pred_depth_current"] = torch.stack(
+            (z_current, depth_uncertainty), dim=-1)
+        out["pred_depth_direct"] = torch.stack(
+            (z_direct, depth_uncertainty), dim=-1)
+        # Keep training and ordinary evaluation on the existing formulation.
+        # Direct replacement is opt-in through Tester variants.
+        out["pred_depth"] = out["pred_depth_current"]
         out.update({
             "pred_horizon_logits": horizon["logits"],
             "pred_horizon_line": horizon["line"],

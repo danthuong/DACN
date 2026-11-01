@@ -72,12 +72,23 @@ class Tester(object):
     def _variant_outputs(outputs, variant):
         if variant in ('final', 'pass2'):
             return outputs
+        if variant in ('current', 'direct'):
+            depth_key = 'pred_depth_' + variant
+            if depth_key not in outputs:
+                raise ValueError(
+                    '{} was requested, but the model did not export {}'.format(
+                        variant, depth_key))
+            selected = dict(outputs)
+            selected['pred_depth'] = outputs[depth_key]
+            selected['_depth_output_variant'] = variant
+            return selected
         if variant == 'pass1':
             if 'pass1_outputs' not in outputs:
                 raise ValueError(
                     'pass1 was requested, but this model output is not an E1 two-pass output')
             return outputs['pass1_outputs']
-        raise ValueError('output variant must be final, pass1, or pass2')
+        raise ValueError(
+            'output variant must be final, pass1, pass2, current, or direct')
 
     def _result_root(self, output_name=None):
         name = output_name if output_name is not None else self.output_name
