@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from utils import box_ops
+from utils.torch_compat import cuda_autocast
 
 
 TOUCH_POINT_NAMES = ("LF", "RF", "RR", "LR")
@@ -376,7 +377,7 @@ def horizon_line_to_ground_plane(
     line: torch.Tensor, p2: torch.Tensor, camera_height_m: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Convert a pixel horizon to a Y-down ground plane ``n.X + d = 0``."""
-    with torch.cuda.amp.autocast(enabled=False):
+    with cuda_autocast(enabled=False):
         line = line.float()
         p2 = p2.float()
         homogeneous_line = torch.stack(
@@ -404,7 +405,7 @@ def raycast_touchpoints_to_plane(
     max_depth: float = 65.0,
 ) -> Dict[str, torch.Tensor]:
     """Backproject normalized touchpoints and intersect them with ground."""
-    with torch.cuda.amp.autocast(enabled=False):
+    with cuda_autocast(enabled=False):
         points = touchpoints_normalized.float()
         projection = p2.float()
         plane = plane.float()

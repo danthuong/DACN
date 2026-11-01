@@ -13,6 +13,7 @@ from lib.helpers.save_helper import load_pretrained_checkpoint
 from lib.helpers.save_helper import save_checkpoint
 
 from utils import misc
+from utils.torch_compat import cuda_autocast, cuda_grad_scaler
 
 
 class Trainer(object):
@@ -58,7 +59,7 @@ class Trainer(object):
         bf16_supported = bool(
             hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported())
         self.amp_dtype = torch.bfloat16 if 'bf16' in precision and bf16_supported else torch.float16
-        self.scaler = torch.cuda.amp.GradScaler(
+        self.scaler = cuda_grad_scaler(
             enabled=self.amp_enabled and self.amp_dtype == torch.float16)
         self.output_dir = os.path.join('./' + cfg['save_path'], model_name)
         self.tester = None
@@ -314,7 +315,7 @@ class Trainer(object):
                 dn_args=(targets, self.cfg['scalar'], self.cfg['label_noise_scale'], self.cfg['box_noise_scale'], self.cfg['num_patterns'])
             ###
             # train one batch
-            with torch.cuda.amp.autocast(enabled=self.amp_enabled):
+            with cuda_autocast(enabled=self.amp_enabled, dtype=self.amp_dtype):
                 outputs = self.model(
                     inputs, calibs, targets, img_sizes, dn_args=dn_args,
                     geometry_calibs=geometry_calibs)

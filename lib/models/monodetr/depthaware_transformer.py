@@ -5,6 +5,8 @@ import copy
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
+
+from utils.torch_compat import meshgrid_ij
 from torch.nn.init import xavier_uniform_, constant_, uniform_, normal_
 
 from utils.misc import inverse_sigmoid
@@ -161,8 +163,9 @@ class DepthAwareTransformer(nn.Module):
             valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
             valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
 
-            grid_y, grid_x = torch.meshgrid(torch.linspace(0, H_ - 1, H_, dtype=torch.float32, device=memory.device),
-                                            torch.linspace(0, W_ - 1, W_, dtype=torch.float32, device=memory.device))
+            grid_y, grid_x = meshgrid_ij(
+                torch.linspace(0, H_ - 1, H_, dtype=torch.float32, device=memory.device),
+                torch.linspace(0, W_ - 1, W_, dtype=torch.float32, device=memory.device))
             grid = torch.cat([grid_x.unsqueeze(-1), grid_y.unsqueeze(-1)], -1)
 
             scale = torch.cat([valid_W.unsqueeze(-1), valid_H.unsqueeze(-1)], 1).view(N_, 1, 1, 2)
@@ -381,8 +384,9 @@ class VisualEncoder(nn.Module):
         reference_points_list = []
         for lvl, (H_, W_) in enumerate(spatial_shapes):
 
-            ref_y, ref_x = torch.meshgrid(torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
-                                          torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
+            ref_y, ref_x = meshgrid_ij(
+                torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
+                torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H_)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W_)
             ref = torch.stack((ref_x, ref_y), -1)

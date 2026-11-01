@@ -76,7 +76,7 @@ class AdamW(Optimizer):
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
         amsgrad (boolean, optional): whether to use the AMSGrad variant of this
             algorithm from the paper `On the Convergence of Adam and Beyond`_
-    .. _Adam\: A Method for Stochastic Optimization:
+    .. _Adam: A Method for Stochastic Optimization:
         https://arxiv.org/abs/1412.6980
     .. _On the Convergence of Adam and Beyond:
         https://openreview.net/forum?id=ryQu7f-RZ
@@ -144,8 +144,8 @@ class AdamW(Optimizer):
                 #     grad = grad.add(group['weight_decay'], p.data)
 
                 # Decay the first and second moment running average coefficient
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
-                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                 if amsgrad:
                     # Maintains the maximum of all 2nd moment running avg. till now
                     torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
@@ -159,6 +159,8 @@ class AdamW(Optimizer):
                 step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
 
                 # p.data.addcdiv_(-step_size, exp_avg, denom)
-                p.data.add_(-step_size,  torch.mul(p.data, group['weight_decay']).addcdiv_(1, exp_avg, denom))
+                update = torch.mul(p.data, group['weight_decay']).addcdiv_(
+                    exp_avg, denom, value=1)
+                p.data.add_(update, alpha=-step_size)
 
         return loss

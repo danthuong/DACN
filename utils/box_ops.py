@@ -9,6 +9,8 @@ Utilities for bounding box manipulation and GIoU.
 import torch
 from torchvision.ops.boxes import box_area
 
+from utils.torch_compat import meshgrid_ij
+
 
 def box_cxcywh_to_xyxy(x):
     x_c, y_c, w, h = x.unbind(-1)
@@ -86,7 +88,7 @@ def masks_to_boxes(masks):
 
     y = torch.arange(0, h, dtype=torch.float)
     x = torch.arange(0, w, dtype=torch.float)
-    y, x = torch.meshgrid(y, x)
+    y, x = meshgrid_ij(y, x)
 
     x_mask = (masks * x.unsqueeze(0))
     x_max = x_mask.flatten(1).max(-1)[0]

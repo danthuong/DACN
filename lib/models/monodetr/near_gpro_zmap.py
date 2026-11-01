@@ -15,6 +15,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from utils.torch_compat import meshgrid_ij
+
 from utils import box_ops
 from utils.misc import (
     NestedTensor,
@@ -79,9 +81,7 @@ class NearContactROIHead(nn.Module):
             device=feature.device,
             dtype=feature.dtype,
         )
-        # PyTorch 1.9 uses ``ij`` ordering by default and does not yet accept
-        # the explicit ``indexing`` keyword introduced in later releases.
-        rel_y, rel_x = torch.meshgrid(coordinates, coordinates)
+        rel_y, rel_x = meshgrid_ij(coordinates, coordinates)
         rel_x = rel_x.view(1, 1, size, size)
         rel_y = rel_y.view(1, 1, size, size)
         xmin, ymin, xmax, ymax = boxes_xyxy.unbind(dim=-1)
