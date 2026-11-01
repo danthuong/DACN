@@ -109,7 +109,7 @@ trainer:
   # rollback checkpoint every T epochs; change this value to choose T.
   validation_frequency: 1
   periodic_checkpoint_interval: "${CHECKPOINT_INTERVAL:-10}"
-  save_frequency: 1              # legacy checkpoint.pth fallback only
+  save_frequency: 5              # legacy checkpoint.pth fallback only
   save_path: outputs/near_gpro_zmap_scratch/
   save_all: false
   save_last_and_best: true

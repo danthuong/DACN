@@ -42,12 +42,11 @@ def get_extensions():
             "-D__CUDA_NO_HALF_OPERATORS__",
             "-D__CUDA_NO_HALF_CONVERSIONS__",
             "-D__CUDA_NO_HALF2_OPERATORS__",
-            "-arch=sm_60",
-            "-gencode=arch=compute_60,code=sm_60",
-            "-gencode=arch=compute_61,code=sm_61",
-            "-gencode=arch=compute_70,code=sm_70",
-            "-gencode=arch=compute_75,code=sm_75",
-]
+        ]
+        # Do not hard-code the legacy Pascal/Turing architecture list.  The
+        # PyTorch extension builder now derives the visible GPU architecture
+        # (or honours TORCH_CUDA_ARCH_LIST), which is required for Ampere GPUs
+        # such as A40 (sm_86) and keeps the extension portable across machines.
     else:
         raise NotImplementedError('Cuda is not availabel')
 
