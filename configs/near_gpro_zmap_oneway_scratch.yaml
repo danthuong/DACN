@@ -1,0 +1,83 @@
+extends: near_gpro_zmap_replace_scratch.yaml
+
+# One-way GPro ablation:
+# - MonoDETR starts from scratch (ResNet keeps its normal ImageNet init).
+# - GPro is present in the forward final-depth formula from epoch 0.
+# - Geometry heads learn only from their direct horizon/touchpoint/centre-depth
+#   supervision; final object-depth loss cannot pull Z_gpro toward Z_map.
+# - Geometry visual inputs are detached so their losses cannot damage the
+#   shared detector backbone and lower recall.
+
+random_seed: 444
+model_name: near_gpro_zmap_oneway_scratch
+
+dataset:
+  batch_size: 12
+
+near_gpro:
+  horizon:
+    visual_feature_detach: true
+
+  near_touchpoint:
+    box_detach: true
+    visual_feature_detach: true
+
+  center_correction:
+    detach_dimensions_yaw: true
+
+  replacement:
+    formula: "(Z_query_reg + Z_size + valid_or_fallback(stopgrad(Z_gpro_center), Z_map)) / 3"
+    detach_gpro_in_final_depth: true
+    min_geometry_confidence: 0.0
+    invalid_policy: original_z_map
+
+  losses:
+    # Auxiliary decoder depths use the old Z-map formula, so disable only
+    # those depth terms. Detection/classification auxiliary losses stay on.
+    aux_depth_loss_coef: 0.0
+
+optimizer:
+  type: adamw
+  lr: 0.0002
+  weight_decay: 0.0001
+  param_groups:
+    original_monodetr_lr: 0.0002
+    horizon_touchpoint_lr: 0.0002
+    geometry_fusion_lr: 0.0001
+  grad_clip_norm: 0.1
+
+lr_scheduler:
+  type: step
+  warmup: true
+  decay_rate: 0.1
+  decay_list: [200, 230]
+
+trainer:
+  pretrain_model: null
+  resume_model: null
+  max_epoch: 260
+  grad_accum_steps: 2
+  validation_frequency: 1
+  periodic_checkpoint_interval: "${CHECKPOINT_INTERVAL:-10}"
+  save_frequency: 20
+  save_path: outputs/near_gpro_zmap_oneway_scratch/
+  save_all: false
+  save_last_and_best: true
+  gpu_ids: "0"
+
+tester:
+  mode: single
+  checkpoint: 260
+  threshold: 0.2
+  topk: 50
+  output_variant: final
+
+logging:
+  log_every_n_steps: 20
+  gradient_norms_every_n_steps: 100
+  wandb:
+    enabled: true
+    mode: "${WANDB_MODE:-offline}"
+    project: DACN
+    run_name: near_gpro_zmap_oneway_scratch_seed444
+    tags: [monodetr, gpro3d, near_center, scratch, one_way_gradient, recall_protected]

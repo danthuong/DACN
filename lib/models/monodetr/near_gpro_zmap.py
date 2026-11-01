@@ -39,6 +39,18 @@ from .geometry_e1 import (
 )
 
 
+def select_replacement_cue(z_gpro, z_map, valid, detach_gpro=False):
+    """Select the scalar replacement cue with optional one-way gradients.
+
+    Detaching only changes backward: forward values and invalid-object fallback
+    remain identical.  This lets direct geometry losses train GPro while the
+    final object-depth loss adapts Z_query/Z_size around an external cue rather
+    than pulling that cue toward the other branches.
+    """
+    gpro_cue = z_gpro.detach() if detach_gpro else z_gpro
+    return torch.where(valid, gpro_cue, z_map)
+
+
 class NearContactROIHead(nn.Module):
     """Predict one box-relative near-contact point from visual ROI features."""
 
@@ -355,6 +367,9 @@ class NearGProMonoDETR(MonoDETR):
         # Keep the legacy trainer on its normal single-output validation path.
         self.geometry_enabled = False
         replacement = self.near_cfg.get("replacement", {})
+        self.detach_gpro_in_final_depth = bool(
+            replacement.get("detach_gpro_in_final_depth", False)
+        )
         self.min_replacement_confidence = float(
             replacement.get("min_geometry_confidence", 0.0)
         )
@@ -493,7 +508,10 @@ class NearGProMonoDETR(MonoDETR):
             geometry["object_reliability"] >= self.min_replacement_confidence
         )
         z_map = out["pred_depth_predictor_sample"]
-        z_cue = torch.where(valid, geometry["object_depth"], z_map)
+        z_cue = select_replacement_cue(
+            geometry["object_depth"], z_map, valid,
+            detach_gpro=self.detach_gpro_in_final_depth,
+        )
         z_baseline = out["pred_depth"][..., 0]
         z_current = (
             out["pred_depth_query_reg"] + out["pred_depth_size"] + z_cue
@@ -696,8 +714,16 @@ def build_near_gpro_zmap(cfg):
         "loss_gpro_center_depth": geometry_losses.get("gpro_center_depth_loss_coef", 1.0),
     })
     if cfg["aux_loss"]:
+        # Intermediate decoder depths still use the original scalar Z-map
+        # formula.  A one-way GPro run can set this coefficient to zero so
+        # those auxiliary losses do not reintroduce Z-map correction pressure
+        # into the shared transformer.  Classification/box auxiliaries remain.
+        auxiliary_depth_coef = geometry_losses.get(
+            "aux_depth_loss_coef", cfg["depth_loss_coef"]
+        )
         auxiliary = {
-            key: value for key, value in weight_dict.items()
+            key: (auxiliary_depth_coef if key == "loss_depth" else value)
+            for key, value in weight_dict.items()
             if key in (
                 "loss_ce", "loss_bbox", "loss_giou", "loss_dim",
                 "loss_angle", "loss_depth", "loss_center",

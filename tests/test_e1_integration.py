@@ -84,6 +84,20 @@ class E1IntegrationTest(unittest.TestCase):
         self.assertEqual(config['tester']['threshold'], 0.2)
         self.assertEqual(config['trainer']['max_epoch'], 100)
 
+    def test_near_gpro_oneway_scratch_config_blocks_geometry_feedback(self):
+        config = load_config(
+            ROOT / 'configs' / 'near_gpro_zmap_oneway_scratch.yaml',
+            ROOT / 'missing.env')
+        near = config['near_gpro']
+        self.assertIsNone(config['trainer']['pretrain_model'])
+        self.assertTrue(near['horizon']['visual_feature_detach'])
+        self.assertTrue(near['near_touchpoint']['visual_feature_detach'])
+        self.assertTrue(
+            near['replacement']['detach_gpro_in_final_depth'])
+        self.assertEqual(near['losses']['aux_depth_loss_coef'], 0.0)
+        self.assertEqual(config['trainer']['max_epoch'], 260)
+        self.assertEqual(config['lr_scheduler']['decay_list'], [200, 230])
+
     def test_distribution_epoch0_configs_match_feature_training_protocol(self):
         joint = load_config(
             ROOT / 'configs' / 'e1_distribution_joint_epoch0.yaml',

@@ -2,7 +2,11 @@ import math
 
 import torch
 
-from lib.models.monodetr.near_gpro_zmap import NearContactROIHead, NearGProGeometry
+from lib.models.monodetr.near_gpro_zmap import (
+    NearContactROIHead,
+    NearGProGeometry,
+    select_replacement_cue,
+)
 
 
 def _geometry():
@@ -63,6 +67,19 @@ def test_zmap_replacement_formula_and_identity_fallback():
     baseline = (z_query + z_size + z_map) / 3.0
     torch.testing.assert_close(final, torch.tensor([[17.0, 20.0]]))
     torch.testing.assert_close(final[:, 1], baseline[:, 1])
+
+
+def test_one_way_replacement_keeps_values_but_blocks_gpro_gradient():
+    z_gpro = torch.tensor([[21.0, 22.0]], requires_grad=True)
+    z_map = torch.tensor([[30.0, 31.0]], requires_grad=True)
+    valid = torch.tensor([[True, False]])
+    cue = select_replacement_cue(
+        z_gpro, z_map, valid, detach_gpro=True
+    )
+    torch.testing.assert_close(cue, torch.tensor([[21.0, 31.0]]))
+    cue.sum().backward()
+    assert z_gpro.grad is None
+    torch.testing.assert_close(z_map.grad, torch.tensor([[0.0, 1.0]]))
 
 
 def test_geometry_visual_detach_blocks_shared_feature_gradients():
