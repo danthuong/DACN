@@ -163,6 +163,21 @@ class Trainer(object):
     def train(self):
         start_epoch = self.epoch
 
+        # Validation and checkpoint retention are deliberately independent.
+        # Historically both were gated by ``save_frequency``, which meant
+        # reducing checkpoint I/O also silently reduced validation frequency.
+        validation_frequency = max(
+            1, int(self.cfg.get('validation_frequency', 1)))
+        periodic_value = self.cfg.get('periodic_checkpoint_interval')
+        if periodic_value is None:
+            # Backward compatibility: old ``save_all: true`` configs retain
+            # their checkpoint_epoch_N behaviour at ``save_frequency``.
+            periodic_checkpoint_interval = (
+                max(1, int(self.cfg.get('save_frequency', 1)))
+                if self.cfg.get('save_all', False) else 0)
+        else:
+            periodic_checkpoint_interval = max(0, int(periodic_value))
+
         progress_bar = tqdm.tqdm(range(start_epoch, self.cfg['max_epoch']), dynamic_ncols=True, leave=True, desc='epochs')
         best_result = self.best_result
         best_epoch = self.best_epoch
@@ -180,89 +195,94 @@ class Trainer(object):
             else:
                 self.lr_scheduler.step()
 
-            # save trained model
-            if (self.epoch % self.cfg['save_frequency']) == 0:
-                os.makedirs(self.output_dir, exist_ok=True)
-                if self.cfg['save_all']:
-                    ckpt_name = os.path.join(self.output_dir, 'checkpoint_epoch_%d' % self.epoch)
+            os.makedirs(self.output_dir, exist_ok=True)
+
+            # Validation has its own cadence and therefore runs every epoch by
+            # default, regardless of the periodic checkpoint interval.
+            should_validate = (
+                self.tester is not None
+                and self.epoch % validation_frequency == 0)
+            if should_validate:
+                self.logger.info("Test Epoch {}".format(self.epoch))
+                model_core = (
+                    self.model.module if isinstance(self.model, nn.DataParallel)
+                    else self.model)
+                if getattr(model_core, 'geometry_enabled', False):
+                    self.tester.inference([
+                        ('pass1', 'pass1'), ('pass2', 'pass2')])
+                    cur_result = self.tester.evaluate('pass2')
+                    depth_summary = self._run_depth_validation()
                 else:
-                    ckpt_name = os.path.join(self.output_dir, 'checkpoint')
-               
-                save_checkpoint(
-                    self._checkpoint_state(self.epoch, best_result, best_epoch),
-                    ckpt_name)
-
-                if self.cfg.get('save_last_and_best', False):
-                    save_checkpoint(
-                        self._checkpoint_state(self.epoch, best_result, best_epoch),
-                        os.path.join(self.output_dir, 'checkpoint_last'))
-
-                if self.tester is not None:
-                    self.logger.info("Test Epoch {}".format(self.epoch))
-                    model_core = (
-                        self.model.module if isinstance(self.model, nn.DataParallel)
-                        else self.model)
-                    if getattr(model_core, 'geometry_enabled', False):
-                        self.tester.inference([
-                            ('pass1', 'pass1'), ('pass2', 'pass2')])
-                        cur_result = self.tester.evaluate('pass2')
-                        depth_summary = self._run_depth_validation()
-                    else:
-                        self.tester.inference()
-                        cur_result = self.tester.evaluate()
-                        depth_summary = None
-                    if self.wandb is not None:
-                        validation_log = {
-                            'epoch': self.epoch,
-                            'val/ap3d_r40_car_moderate': float(cur_result),
-                        }
-                        if depth_summary is not None:
-                            for name, values in depth_summary['models'].items():
-                                for key in ('mae', 'rmse', 'median_ae', 'p90_ae',
-                                            'signed_bias', 'abs_rel', 'recall'):
-                                    if values.get(key) is not None:
-                                        validation_log['val/{}/{}'.format(name, key)] = values[key]
-                            output_dir = self.validation_cfg.get('output_dir')
-                            if output_dir:
-                                self.wandb.log_artifact(
-                                    output_dir, 'validation-epoch-{}'.format(self.epoch),
-                                    'validation')
-                            wandb_cfg = self.logging_cfg.get('wandb', {})
-                            if wandb_cfg.get('log_validation_images', False):
-                                from lib.helpers.e1_visualization import render_validation_examples
-                                examples = render_validation_examples(
-                                    self.test_loader.dataset,
-                                    self.tester._result_root('pass2'),
-                                    int(wandb_cfg.get('val_visualization_samples', 8)))
-                                self.wandb.log_images(
-                                    'val/examples_camera_bev', examples,
-                                    step=self.global_step)
-                        self.wandb.log(validation_log, step=self.global_step)
+                    self.tester.inference()
+                    cur_result = self.tester.evaluate()
+                    depth_summary = None
+                if self.wandb is not None:
+                    validation_log = {
+                        'epoch': self.epoch,
+                        'val/ap3d_r40_car_moderate': float(cur_result),
+                    }
                     if depth_summary is not None:
-                        pass2_mae = depth_summary['models'].get('pass2', {}).get('mae')
-                        if pass2_mae is not None and np.isfinite(pass2_mae) and (
-                                pass2_mae < self.best_depth_result):
-                            self.best_depth_result = pass2_mae
-                            save_checkpoint(
-                                self._checkpoint_state(
-                                    self.epoch, best_result, best_epoch),
-                                os.path.join(self.output_dir, 'checkpoint_best_depth'))
-                    if cur_result > best_result:
-                        best_result = cur_result
-                        best_epoch = self.epoch
-                        ckpt_name = os.path.join(self.output_dir, 'checkpoint_best')
+                        for name, values in depth_summary['models'].items():
+                            for key in ('mae', 'rmse', 'median_ae', 'p90_ae',
+                                        'signed_bias', 'abs_rel', 'recall'):
+                                if values.get(key) is not None:
+                                    validation_log['val/{}/{}'.format(name, key)] = values[key]
+                        output_dir = self.validation_cfg.get('output_dir')
+                        if output_dir:
+                            self.wandb.log_artifact(
+                                output_dir, 'validation-epoch-{}'.format(self.epoch),
+                                'validation')
+                        wandb_cfg = self.logging_cfg.get('wandb', {})
+                        if wandb_cfg.get('log_validation_images', False):
+                            from lib.helpers.e1_visualization import render_validation_examples
+                            examples = render_validation_examples(
+                                self.test_loader.dataset,
+                                self.tester._result_root('pass2'),
+                                int(wandb_cfg.get('val_visualization_samples', 8)))
+                            self.wandb.log_images(
+                                'val/examples_camera_bev', examples,
+                                step=self.global_step)
+                    self.wandb.log(validation_log, step=self.global_step)
+                if depth_summary is not None:
+                    pass2_mae = depth_summary['models'].get('pass2', {}).get('mae')
+                    if pass2_mae is not None and np.isfinite(pass2_mae) and (
+                            pass2_mae < self.best_depth_result):
+                        self.best_depth_result = pass2_mae
                         save_checkpoint(
-                            self._checkpoint_state(self.epoch, best_result, best_epoch),
-                            ckpt_name)
-                    self.logger.info("Best Result:{}, epoch:{}".format(best_result, best_epoch))
+                            self._checkpoint_state(
+                                self.epoch, best_result, best_epoch),
+                            os.path.join(self.output_dir, 'checkpoint_best_depth'))
+                if cur_result > best_result:
+                    best_result = cur_result
+                    best_epoch = self.epoch
+                    save_checkpoint(
+                        self._checkpoint_state(
+                            self.epoch, best_result, best_epoch),
+                        os.path.join(self.output_dir, 'checkpoint_best'))
+                self.logger.info(
+                    "Best Result:{}, epoch:{}".format(best_result, best_epoch))
 
-                # Validation may have changed best metrics; keep resume files exact.
-                if self.cfg.get('save_last_and_best', False):
-                    state = self._checkpoint_state(
-                        self.epoch, best_result, best_epoch)
-                    save_checkpoint(state, os.path.join(self.output_dir, 'checkpoint_last'))
-                    if not self.cfg['save_all']:
-                        save_checkpoint(state, os.path.join(self.output_dir, 'checkpoint'))
+            # Latest is a resumable checkpoint and is refreshed after
+            # validation so its best-result metadata is always exact.
+            state = self._checkpoint_state(
+                self.epoch, best_result, best_epoch)
+            if self.cfg.get('save_last_and_best', False):
+                save_checkpoint(state, os.path.join(self.output_dir, 'checkpoint_last'))
+                # Preserve the historical generic resume filename.
+                save_checkpoint(state, os.path.join(self.output_dir, 'checkpoint'))
+            elif self.epoch % max(1, int(self.cfg.get('save_frequency', 1))) == 0:
+                save_checkpoint(state, os.path.join(self.output_dir, 'checkpoint'))
+
+            # Periodic snapshots are retained even when ``save_all`` is false;
+            # this keeps tester's default "best" behaviour while allowing an
+            # exact rollback to every T-th epoch.
+            if periodic_checkpoint_interval > 0 and (
+                    self.epoch % periodic_checkpoint_interval == 0):
+                save_checkpoint(
+                    state,
+                    os.path.join(
+                        self.output_dir,
+                        'checkpoint_epoch_%d' % self.epoch))
 
             progress_bar.update()
 
