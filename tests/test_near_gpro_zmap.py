@@ -63,3 +63,26 @@ def test_zmap_replacement_formula_and_identity_fallback():
     baseline = (z_query + z_size + z_map) / 3.0
     torch.testing.assert_close(final, torch.tensor([[17.0, 20.0]]))
     torch.testing.assert_close(final[:, 1], baseline[:, 1])
+
+
+def test_geometry_visual_detach_blocks_shared_feature_gradients():
+    geometry = NearGProGeometry({
+        "horizon": {
+            "visual_feature_detach": True,
+            "vertical_edge_refinement": {"enabled": False},
+        },
+        "near_touchpoint": {
+            "roi_channels": 64,
+            "visual_feature_detach": True,
+        },
+    })
+    srcs = [
+        torch.randn(1, 256, 8 // (2 ** level), 16 // (2 ** level),
+                    requires_grad=True)
+        for level in range(3)
+    ]
+    horizon = geometry.predict_horizon(srcs, (32, 64))
+    horizon["logits"].sum().backward()
+    assert all(source.grad is None for source in srcs)
+    assert any(parameter.grad is not None
+               for parameter in geometry.horizon_head.parameters())

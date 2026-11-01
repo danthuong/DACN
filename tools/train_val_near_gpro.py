@@ -26,6 +26,34 @@ from lib.helpers.wandb_helper import WandbLogger
 from lib.models.monodetr.near_gpro_zmap import build_near_gpro_zmap
 
 
+def configure_trainable_parameters(model, trainer_cfg, logger):
+    """Optionally isolate new geometry heads from pretrained MonoDETR.
+
+    The switch is deliberately implemented before optimizer construction so
+    frozen tensors never enter AdamW state.  Both plain and DataParallel names
+    contain ``geometry_e1.`` for the newly introduced modules.
+    """
+    if not bool(trainer_cfg.get("freeze_original_monodetr", False)):
+        return
+    trainable, frozen = 0, 0
+    for name, parameter in model.named_parameters():
+        is_geometry = "geometry_e1." in name
+        parameter.requires_grad_(is_geometry)
+        count = parameter.numel()
+        if is_geometry:
+            trainable += count
+        else:
+            frozen += count
+    if trainable == 0:
+        raise RuntimeError(
+            "freeze_original_monodetr=true but no geometry_e1 parameters were found"
+        )
+    logger.info(
+        "Frozen-pretrained geometry stage: %d trainable geometry parameters, "
+        "%d frozen MonoDETR parameters", trainable, frozen,
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -81,6 +109,7 @@ def main(args=None):
             tester.test()
         return
 
+    configure_trainable_parameters(model, cfg["trainer"], logger)
     optimizer = build_optimizer(cfg["optimizer"], model)
     scheduler_cfg = dict(cfg["lr_scheduler"])
     scheduler_cfg["max_epoch"] = cfg["trainer"]["max_epoch"]

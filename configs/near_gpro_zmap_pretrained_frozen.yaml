@@ -1,0 +1,66 @@
+extends: near_gpro_zmap_replace_scratch.yaml
+
+# Stage-1 gradient-isolation ablation:
+#   1. restore the strongest original MonoDETR detector/depth checkpoint;
+#   2. freeze every original MonoDETR parameter;
+#   3. train only the horizon and near-contact ROI heads;
+#   4. detach their visual inputs so geometry supervision cannot alter the
+#      detector backbone.  The old scratch config is left unchanged.
+
+random_seed: 444
+model_name: near_gpro_zmap_pretrained_frozen
+
+near_gpro:
+  horizon:
+    visual_feature_detach: true
+  near_touchpoint:
+    visual_feature_detach: true
+
+optimizer:
+  type: adamw
+  lr: 0.0002
+  weight_decay: 0.0001
+  param_groups:
+    # Excluded from the optimizer while freeze_original_monodetr is true.
+    original_monodetr_lr: 0.0
+    horizon_touchpoint_lr: 0.0002
+    geometry_fusion_lr: 0.0002
+  grad_clip_norm: 0.1
+
+lr_scheduler:
+  type: step
+  warmup: true
+  decay_rate: 0.1
+  decay_list: [70, 90]
+
+trainer:
+  # Override with MONODETR_BEST_CKPT if the baseline checkpoint lives elsewhere.
+  pretrain_model: "${MONODETR_BEST_CKPT:-outputs/monodetr/checkpoint_best.pth}"
+  resume_model: null
+  freeze_original_monodetr: true
+  max_epoch: 100
+  grad_accum_steps: 2
+  validation_frequency: 1
+  periodic_checkpoint_interval: "${CHECKPOINT_INTERVAL:-10}"
+  save_frequency: 20
+  save_path: outputs/near_gpro_zmap_pretrained_frozen/
+  save_all: false
+  save_last_and_best: true
+  gpu_ids: "0"
+
+tester:
+  mode: single
+  checkpoint: 100
+  threshold: 0.2
+  topk: 50
+  output_variant: final
+
+logging:
+  log_every_n_steps: 20
+  gradient_norms_every_n_steps: 100
+  wandb:
+    enabled: true
+    mode: "${WANDB_MODE:-offline}"
+    project: DACN
+    run_name: near_gpro_zmap_pretrained_frozen_seed444
+    tags: [monodetr, gpro3d, near_center, pretrained, frozen_detector, gradient_isolation]

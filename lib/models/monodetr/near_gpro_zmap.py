@@ -155,6 +155,13 @@ class NearGProGeometry(nn.Module):
         self.horizon_entropy_confidence = bool(
             horizon_cfg.get("entropy_confidence", True)
         )
+        # Optional one-way geometry supervision: the horizon head still learns
+        # from frozen visual features, but its losses cannot rewrite the shared
+        # MonoDETR backbone.  Keep this disabled by default so existing
+        # ablations remain bit-for-bit equivalent.
+        self.detach_horizon_visual = bool(
+            horizon_cfg.get("visual_feature_detach", False)
+        )
         self.vertical_edge_refiner = VerticalEdgeHorizonRefiner(
             horizon_cfg.get("vertical_edge_refinement", {})
         )
@@ -172,7 +179,11 @@ class NearGProGeometry(nn.Module):
         self.class_index = int(touch_cfg.get("class_index", 1))
 
     def predict_horizon(self, srcs, image_hw, images=None):
-        logits = self.horizon_head(srcs)
+        horizon_srcs = (
+            [source.detach() for source in srcs]
+            if self.detach_horizon_visual else srcs
+        )
+        logits = self.horizon_head(horizon_srcs)
         raw_line, expected_row, confidence = decode_horizon_line(
             logits,
             image_hw,

@@ -71,6 +71,19 @@ class E1IntegrationTest(unittest.TestCase):
         self.assertEqual(config['lr_scheduler']['decay_list'], [125, 165])
         self.assertTrue(config['lr_scheduler']['warmup'])
 
+    def test_near_gpro_pretrained_frozen_config_isolates_detector(self):
+        config = load_config(
+            ROOT / 'configs' / 'near_gpro_zmap_pretrained_frozen.yaml',
+            ROOT / 'missing.env')
+        self.assertTrue(config['trainer']['pretrain_model'])
+        self.assertTrue(config['trainer']['freeze_original_monodetr'])
+        self.assertTrue(
+            config['near_gpro']['horizon']['visual_feature_detach'])
+        self.assertTrue(
+            config['near_gpro']['near_touchpoint']['visual_feature_detach'])
+        self.assertEqual(config['tester']['threshold'], 0.2)
+        self.assertEqual(config['trainer']['max_epoch'], 100)
+
     def test_distribution_epoch0_configs_match_feature_training_protocol(self):
         joint = load_config(
             ROOT / 'configs' / 'e1_distribution_joint_epoch0.yaml',
