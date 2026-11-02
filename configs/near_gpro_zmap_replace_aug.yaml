@@ -1,0 +1,35 @@
+extends: near_gpro_zmap_replace_scratch.yaml
+
+# Same model/losses/schedule as the best near_gpro_zmap_replace_scratch run,
+# with the original MonoDETR augmentation restored (flip 0.5, crop 0.5,
+# depth_scale normal) so AP/recall are comparable to the MonoDETR baseline.
+#
+# Flip: pixel labels are mapped through the exact input P2 and the
+# near-to-centre footprint offsets are symmetric, so GPro depth is unchanged.
+# Crop: depth labels become Z * crop_scale. The geometry branch therefore uses
+# a virtual camera (focal * crop_scale about the principal point) whose
+# ray/plane depth equals that label. Validation has crop_scale = 1, so the
+# virtual camera is identical to the real one at eval time.
+random_seed: 444
+model_name: near_gpro_zmap_replace_aug
+
+dataset:
+  aug_pd: true
+  aug_crop: true
+  random_flip: 0.5
+  random_crop: 0.5
+  scale: 0.05
+  shift: 0.05
+  depth_scale: normal
+
+near_gpro:
+  augmentation:
+    depth_consistent_geometry_calib: true
+
+trainer:
+  save_path: outputs/near_gpro_zmap_replace_aug/
+
+logging:
+  wandb:
+    run_name: near_gpro_zmap_replace_aug_seed444
+    tags: [monodetr, gpro3d, near_center, box_relative, zmap_replacement, scratch, augmentation]

@@ -29,6 +29,14 @@ class NearGProKITTIDataset(KITTI_Dataset):
             },
         }
         super().__init__(split=split, cfg=adapted)
+        # With random crop and ``depth_scale: normal`` the depth label becomes
+        # Z * crop_scale, while ray/plane on the true input P2 returns Z.
+        # Opt-in so the earlier no-crop ablations stay bit-for-bit identical.
+        self.depth_consistent_geometry_calib = bool(
+            self.near_cfg.get("augmentation", {}).get(
+                "depth_consistent_geometry_calib", False
+            )
+        )
 
     @staticmethod
     def _input_homography(input_p2, original_p2):
@@ -36,6 +44,35 @@ class NearGProKITTIDataset(KITTI_Dataset):
         return np.asarray(input_p2, dtype=np.float64) @ np.linalg.pinv(
             np.asarray(original_p2, dtype=np.float64)
         )
+
+    @staticmethod
+    def _depth_consistent_calib(input_p2, depth_factor):
+        """Virtual camera whose ground-plane depth equals ``Z * depth_factor``.
+
+        Scaling the focal length about the principal point divides every ray
+        slope by ``depth_factor``, so a ray hits the plane ``Y = h`` at the
+        same X and ``depth_factor`` times the depth.  Pixel coordinates (and
+        therefore horizon/touchpoint labels) are unchanged.
+        """
+        p2 = np.asarray(input_p2, dtype=np.float64)
+        s = float(depth_factor)
+        cx, cy = p2[0, 2], p2[1, 2]
+        scale = np.array(
+            [[s, 0.0, cx * (1.0 - s)], [0.0, s, cy * (1.0 - s)], [0.0, 0.0, 1.0]]
+        )
+        return (scale @ p2).astype(np.float32)
+
+    def _label_depth_factor(self, targets, info):
+        # affine[0, 0] = resolution / (img_size * crop_scale); flip lives in a
+        # separate matrix, so this entry is always positive.
+        crop_scale = float(self.resolution[0]) / (
+            float(info["img_size"][0]) * float(targets["affine"][0, 0])
+        )
+        if self.depth_scale == "normal":
+            return crop_scale
+        if self.depth_scale == "inverse":
+            return 1.0 / crop_scale
+        return 1.0
 
     def __getitem__(self, item):
         result = super().__getitem__(item)
@@ -95,6 +132,15 @@ class NearGProKITTIDataset(KITTI_Dataset):
         targets["near_touchpoint"] = near_point
         targets["near_touchpoint_box_offset"] = near_offset
         targets["near_touchpoint_valid"] = near_valid
+        # Replace only after all pixel labels were mapped with the true P2.
+        if self.depth_consistent_geometry_calib:
+            factor = self._label_depth_factor(targets, info)
+            if abs(factor - 1.0) > 1e-6:
+                geometry_calib = self._depth_consistent_calib(
+                    targets["input_calib"], factor
+                )
+                targets["input_calib"] = geometry_calib
+                info["input_calib"] = geometry_calib
         return inputs, calib, targets, info
 
 
